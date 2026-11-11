@@ -1,7 +1,7 @@
 /* dock.js — 右侧面板：任务 / 上下文 / 插件 */
 
-import { state, bus, h, $, persist, debounce, toast, normalizeConversationMode, soloAgent } from './core.js'
-import { ROLE_LABEL } from './llm.js'
+import { state, bus, h, $, persist, debounce, toast, normalizeConversationMode, soloAgent, activeProject, superChatActive } from './core.js'
+import { ROLE_LABEL, CONTEXT_LAYERS, FIXED_CONTEXT_LAYERS, promptSections, buildSystemPrompt } from './llm.js'
 import { openSettings } from './settings.js'
 import { openModal, closeModal } from './modal.js'
 import { confirmAction } from './confirm.js'
@@ -9,6 +9,7 @@ import { createTaskScene } from './taskscene.js'
 import { renderPreview } from './filepreview.js'
 import { pluginDockPanes, pluginEnabled, setPluginEnabledLive, pluginConfig, savePluginSettings, isLegacyRuntime } from './plugins.js'
 import { jobStatusLabel, activeJobId, createJob, startJob, pauseJob, removeJob, decomposeGoal, startAllInterrupted } from './jobs.js'
+import { openContextDistill } from './context-distill.js'
 
 let pane = 'tasks'
 let lastMode = ''
@@ -20,7 +21,42 @@ let savedDockWidth = ''
 let contextAgentId = ''
 let skillScope = 'agent'
 let skillStatusText = ''
+/* 进直连会话前的右栏状态，离开时按原样还原 */
+let superDock = null
 const PREVIEW_WIDTH = 560
+
+/* 直连会话只跟它说话，右栏不挂项目面板：任务、上下文、知识库都收起来，
+   只留「插件」这一页。以后真有插件面板需要在直连里出现，把 id 加进来。 */
+const SUPER_DOCK_PANES = new Set(['plugins'])
+
+function paneAllowedIn (name, superMode) {
+  /* 文件预览是用户点文件时临时开的一页，不参与模式裁剪 */
+  if (name === 'preview') return true
+  return superMode ? SUPER_DOCK_PANES.has(name) : true
+}
+
+function paneAllowed (name) {
+  return paneAllowedIn(name, superChatActive())
+}
+
+function paneUsable (name) {
+  if (!paneAllowed(name)) return false
+  if (name === 'tasks' && currentDockMode() !== 'team') return false
+  return true
+}
+
+function fallbackPane () {
+  return superChatActive() ? 'plugins' : defaultPaneForMode(currentDockMode())
+}
+
+function dockCollapsed () {
+  return document.body.classList.contains('dock-collapsed')
+}
+
+function setDockCollapsed (collapsed) {
+  document.body.classList.toggle('dock-collapsed', collapsed)
+  window.dispatchEvent(new Event('resize'))
+}
 
 function dockWidthPx () {
   return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--dock-w')) || 0
@@ -88,7 +124,8 @@ function selectPane (name) {
 }
 
 export function openDockPane (name) {
-  if (name === 'tasks' && currentDockMode() !== 'team') return false
+  /* 直连会话里项目面板不可达，调用方拿到 false 就知道没打开 */
+  if (!paneUsable(name)) return false
   let tab = document.querySelector(`#dock-tabs button[data-pane="${name}"]`)
   if (!tab) {
     /* 插件面板的 pane id 是「插件 id:面板 id」；允许调用方只传插件 id。 */
@@ -111,22 +148,32 @@ function defaultPaneForMode (mode) {
   return mode === 'team' ? 'tasks' : 'context'
 }
 
-/* 任务轨迹只对团队会话有意义；单独/插件会话直接隐藏这个页签。 */
+/* 页签可见性只有一处判断：
+   - 任务轨迹只对团队会话有意义，单独/插件会话隐藏；
+   - 直连会话只留「插件」，任务 / 上下文 / 知识库这些项目面板一律不出现。 */
 function syncModeTabs () {
   const mode = currentDockMode()
-  const tasksTab = document.querySelector('#dock-tabs button[data-pane="tasks"]')
-  if (tasksTab) tasksTab.hidden = mode !== 'team'
+  const tabs = $('#dock-tabs')
+  if (!tabs) return
+  const superMode = superChatActive()
+  for (const btn of tabs.children) {
+    const name = btn.dataset && btn.dataset.pane
+    if (!name) continue
+    if (superMode) btn.hidden = !paneAllowedIn(name, true)
+    else if (name === 'tasks') btn.hidden = mode !== 'team'
+    else btn.hidden = false
+  }
 }
 
 function syncModePane () {
   const mode = currentDockMode()
-  const desired = defaultPaneForMode(mode)
+  const desired = fallbackPane()
   const modeChanged = lastMode && mode !== lastMode
   const onDefaultPane = pane === 'tasks' || pane === 'context'
   lastMode = mode
   syncModeTabs()
-  if (pane === 'tasks' && mode !== 'team') {
-    selectPane('context')
+  if (!paneAllowed(pane)) {
+    selectPane(desired)
     return
   }
   if (modeChanged && onDefaultPane && pane !== desired) {
@@ -147,9 +194,10 @@ function syncPluginTabs () {
     else tabs.append(tab)
   }
   if (!tabs.querySelector(`button[data-pane="${pane}"]`)) {
-    pane = defaultPaneForMode(currentDockMode())
+    pane = fallbackPane()
     tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('active', b.dataset.pane === pane))
   }
+  syncModeTabs()
 }
 
 export function mountDock () {
@@ -201,7 +249,29 @@ export function mountDock () {
   bus.on('plugins:changed', () => { if (pane === 'plugins') render() })
   bus.on('jobs:changed', () => { if (pane === 'tasks') render() })
   bus.on('usage:changed', () => { if (pane === 'context') render() })
+  bus.on('dock:refresh', () => { if (pane === 'context') render() })
   bus.on('dock:panes:changed', () => { syncPluginTabs(); render() })
+
+  /* 直连会话里右栏没有可看的东西：进去先收起，点开也只剩「插件」。
+     离开时还原进去前的页签与展开状态；用户在直连里自己点开过就不再替他收起。 */
+  bus.on('super:enter', () => {
+    superDock = { collapsed: dockCollapsed(), pane }
+    if (!superDock.collapsed) setDockCollapsed(true)
+    syncModeTabs()
+    if (!paneAllowed(pane)) selectPane(fallbackPane())
+  })
+  bus.on('super:leave', () => {
+    const saved = superDock
+    superDock = null
+    syncModeTabs()
+    const target = saved && saved.pane && document.querySelector(`#dock-tabs button[data-pane="${saved.pane}"]`)
+      ? saved.pane
+      : fallbackPane()
+    const next = paneUsable(target) ? target : fallbackPane()
+    if (next !== pane) selectPane(next)
+    else render()
+    if (saved && !saved.collapsed && dockCollapsed()) setDockCollapsed(false)
+  })
 
   render()
 }
@@ -219,6 +289,12 @@ function playDockSwap () {
 function render () {
   const body = $('#dock-body')
   if (!body) return
+  /* 兜底：模式变了但还有别处直接调 render，别让整栏留白 */
+  if (!paneUsable(pane)) {
+    pane = fallbackPane()
+    const tabs = $('#dock-tabs')
+    if (tabs) [...tabs.children].forEach((b) => b.classList.toggle('active', b.dataset.pane === pane))
+  }
   if (taskScene) {
     taskScene.destroy()
     taskScene = null
@@ -258,9 +334,24 @@ function renderPreviewPane (body) {
 /* ------------------------------------------------------------------ 任务 */
 
 function renderTasks (body) {
+  renderTaskFolder(body)
   taskScene = createTaskScene()
   body.append(taskScene.root)
   renderJobs(body)
+}
+
+/* 任务产生的文件都落在项目文件夹里：给一行直达入口就够，不铺成卡片 */
+function renderTaskFolder (body) {
+  const project = activeProject()
+  if (!project || !project.rootPath) return
+  body.append(h('div', { class: 'dock-folder' },
+    h('span', { class: 'txt', text: project.rootPath }),
+    h('button', {
+      class: 'chip',
+      type: 'button',
+      onclick: () => window.astral.openFile(project.rootPath)
+    }, '在文件夹中打开')
+  ))
 }
 
 function openNewJob () {
@@ -450,7 +541,15 @@ function mergeSkillCatalog (fileSkills) {
 function renderContext (body) {
   const roster = state.roster
 
-  body.append(h('div', { class: 'pane-title', text: '项目上下文' }))
+  body.append(h('div', { class: 'pane-title' },
+    h('span', { text: '项目上下文' }),
+    h('button', {
+      class: 'ctx-distill',
+      type: 'button',
+      title: '让总指挥把这段会话里长期成立的结论沉淀成项目上下文',
+      onclick: () => openContextDistill({ scope: 'global' })
+    }, '✦ 沉淀')
+  ))
 
   const usage = state.usage
   body.append(h('div', { class: 'usage-card' },
@@ -483,16 +582,42 @@ function renderContext (body) {
   }, 500))
   body.append(global)
 
-  /* 标准会话只属于「你 + 当前成员」，把整个编制的资料摆在这里既不对也没用：
+  /* 硬性上下文不在这条会话的提示词里，而是超级智能体的常驻块；
+     入口放到记忆控制台，避免用户把「项目上下文」和它混成一份。 */
+  body.append(h('div', { class: 'ctx-hard-link' },
+    h('button', {
+      class: 'ctx-distill',
+      type: 'button',
+      title: '每一轮都会进入超级智能体系统提示词的常驻四块',
+      onclick: async () => {
+        if (!window.astral.memoryOpenConsole) { toast('当前版本不支持打开记忆控制台'); return }
+        const res = await window.astral.memoryOpenConsole({ view: 'hard' })
+        if (!res || res.ok === false) toast('打开失败：' + ((res && res.error) || '未知错误'))
+      }
+    }, '硬性上下文'),
+    h('span', { class: 'hint', text: '每轮注入的系统提示词，可在记忆控制台查看和编辑' })
+  ))
+
+  /* 标准会话只属于「你 + 当前成员」，把整个编制资料摆在这里既不对也没用：
      其他成员的专属上下文根本不会进这条会话的提示词。只有团队（协作区）才需要全编制切换。 */
   const agents = state.roster.agents
   const mode = currentDockMode()
   /* 非团队会话只有一条线：就是这条会话绑定的那一位（与派单目标一致） */
   const currentAgent = mode === 'team' ? null : soloAgent()
 
-  function memberTitle (text) {
-    return h('div', { class: 'pane-title', style: { marginTop: '16px' }, text })
+  function memberTitle (text, action = null) {
+    return h('div', { class: 'pane-title', style: { marginTop: '16px' } },
+      h('span', { text }),
+      action
+    )
   }
+
+  const distillButton = (agentGetter, hint) => h('button', {
+    class: 'ctx-distill',
+    type: 'button',
+    title: hint,
+    onclick: () => openContextDistill({ scope: 'agent', agentId: agentGetter() })
+  }, '✦ 沉淀')
 
   function notesEditor (agent, placeholder) {
     const area = h('textarea', { class: 'note-area', placeholder })
@@ -508,7 +633,8 @@ function renderContext (body) {
   }
 
   if (mode === 'team') {
-    body.append(memberTitle('成员专属上下文'))
+    body.append(memberTitle('成员专属上下文', distillButton(() => contextAgentId,
+      '让选中的这位成员把自己的长期设定沉淀成专属上下文')))
     if (!agents.length) {
       body.append(h('div', { class: 'dock-empty', text: '编制为空；通用技能仍可预先配置，新增成员后自动生效。' }))
     }
@@ -537,7 +663,8 @@ function renderContext (body) {
     }
   } else {
     /* 单独会话与插件制作都是一人一线：只能编辑当前对话对象的资料，没有下拉、也看不到别人 */
-    body.append(memberTitle('当前助手专属上下文'))
+    body.append(memberTitle('当前助手专属上下文', distillButton(() => currentAgent && currentAgent.id,
+      '让这位助手把自己的长期设定沉淀成专属上下文')))
     if (!currentAgent) {
       body.append(h('div', { class: 'dock-empty', text: '这个会话还没有绑定智能体，先在左栏选一位再写专属资料。' }))
     } else {
@@ -549,6 +676,97 @@ function renderContext (body) {
       )
     }
   }
+
+  /* ------------------------------------------------------------ 上下文注入控制 */
+  /* 这里显示的就是这一轮真正会进系统提示词的层，不是另一份说明文案：
+     字符数由 promptSections 现算，开关直接落到 settings.context.layers。 */
+  const layerAgent = mode === 'team'
+    ? (state.roster.agents.find((a) => a.id === contextAgentId) || state.roster.agents[0] || null)
+    : currentAgent
+  const channel = state.view === 'agent' ? 'agent' : 'user'
+  const sections = layerAgent ? promptSections(layerAgent, { channel }) : []
+  const byKey = new Map(sections.map((s) => [s.key, s]))
+  const layers = state.settings.context && state.settings.context.layers
+    ? state.settings.context.layers
+    : (state.settings.context.layers = {})
+  const layerOn = (key) => layers[key] !== false
+  const hardChars = state.hardContext && state.hardContext.total ? state.hardContext.total : 0
+  const activeChars = sections
+    .filter((s) => s.fixed || layerOn(s.key))
+    .reduce((n, s) => n + s.text.length, 0)
+
+  body.append(memberTitle('上下文注入控制', h('span', {
+    class: 'hint',
+    text: layerAgent ? `当前约 ${activeChars} 字（硬性上下文另计）` : '未绑定智能体'
+  })))
+
+  const layerList = h('div', { class: 'layer-list' })
+  const rows = [
+    ...CONTEXT_LAYERS.map((layer) => ({ ...layer, fixed: false })),
+    ...FIXED_CONTEXT_LAYERS.map((layer) => ({ ...layer, fixed: true }))
+  ]
+  for (const layer of rows) {
+    const section = byKey.get(layer.key)
+    const chars = layer.key === 'hard' ? hardChars : (section ? section.text.length : 0)
+    const on = layer.fixed ? true : layerOn(layer.key)
+    const row = h('div', { class: 'layer-row' + (on ? ' on' : '') + (chars ? '' : ' empty') },
+      h('div', { class: 'layer-main' },
+        h('div', { class: 'layer-name' }, layer.label,
+          layer.fixed ? h('span', { class: 'layer-tag', text: '固定' }) : null,
+          layer.key === 'hard' ? h('span', { class: 'layer-tag', text: '超级智能体' }) : null),
+        h('div', { class: 'layer-hint', text: layer.hint })
+      ),
+      h('div', { class: 'layer-side' },
+        h('span', { class: 'layer-chars', text: chars ? chars + ' 字' : '空' }),
+        h('div', {
+          class: 'switch' + (on ? ' on' : '') + (layer.fixed || !layerAgent ? ' disabled' : ''),
+          role: 'switch',
+          'aria-checked': on ? 'true' : 'false',
+          'aria-label': layer.label,
+          title: layer.fixed ? '固定层，不可关闭' : (layerAgent ? '点击开关这一层' : '先绑定智能体'),
+          onclick: () => {
+            if (layer.fixed || !layerAgent) return
+            layers[layer.key] = !on
+            persist.settings()
+            bus.emit('dock:refresh')
+          }
+        })
+      )
+    )
+    layerList.append(row)
+  }
+  body.append(layerList)
+
+  body.append(h('div', { class: 'layer-actions' },
+    h('button', {
+      class: 'ctx-distill',
+      type: 'button',
+      onclick: () => {
+        if (!layerAgent) return
+        const text = buildSystemPrompt(layerAgent, { channel })
+        openModal({
+          title: '这一轮会注入什么',
+          sub: `${layerAgent.name} · ${channel === 'user' ? '用户 ↔ AI' : 'AI ↔ AI'} · 关闭的层不会出现在这里`,
+          width: 820,
+          render: (box) => {
+            box.append(
+              h('div', { class: 'hint', text: `系统提示词共 ${text.length} 字；硬性上下文只进超级智能体窗口，不计入这段。` }),
+              h('pre', { class: 'prompt-preview', text })
+            )
+          }
+        })
+      }
+    }, '查看完整提示词'),
+    h('button', {
+      class: 'ctx-distill',
+      type: 'button',
+      onclick: () => openSettings('run')
+    }, '历史与预算')
+  ))
+  body.append(h('div', {
+    class: 'hint',
+    text: '关闭只影响这一轮之后的注入，不删除任何内容；权限与工具清单必须和真实授权一致，所以不提供开关。'
+  }))
 
   /* ---------------------------------------------------------------- 技能窗口 */
   const skillWindow = h('div', { class: 'skill-window' })
@@ -829,6 +1047,11 @@ function openPluginSettings (plugin) {
 }
 
 function renderPlugins (body) {
+  /* 直连会话里这是唯一保留的一页，先说清楚别的页去哪了 */
+  if (superChatActive()) {
+    body.append(h('div', { class: 'dock-note' },
+      '直连会话只保留这一页：任务、上下文、知识库都在项目会话里，回到任意项目就能看到。'))
+  }
   if (!state.plugins.length) {
     body.append(h('div', { class: 'dock-empty' },
       h('div', {}, '没有加载任何插件。'),

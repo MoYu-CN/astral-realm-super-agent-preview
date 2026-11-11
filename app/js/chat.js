@@ -1,15 +1,17 @@
 /* chat.js — 消息流渲染与输入区 */
 
-import { state, bus, $, h, md, timeLabel, toast, commander, avatarNode, messagesOf, migrateToolLog, stripSummaryMarker, persist, conversationIsTeam, soloAgent } from './core.js'
+import { state, bus, $, h, md, timeLabel, toast, commander, avatarNode, messagesOf, migrateToolLog, stripSummaryMarker, persist, conversationIsTeam, soloAgent, superChatActive, superMessages, findMsg } from './core.js'
 import { submit, cancelCurrentTurn } from './orchestrator.js'
 import { ROLE_LABEL } from './llm.js'
 import { mountToolbar } from './toolbar.js'
 import { playViewTransition } from './wintransition.js'
 import { openMemberProfile } from './roster.js'
 import { currentView, isReadonlyView, agentEmptyNode } from './viewswitch.js'
+import { superSend, superEmptyNode, superProfile } from './superagent.js'
 import { icon } from './icons.js'
 import { normalizeFoldMessages } from './fold-state.js'
 import { openArchive } from './renew.js'
+import { isGuest } from './roles.js'
 import { formatTokenCount } from './contextmeter.js'
 import { createInlineAsk } from './ask-inline.js'
 import { confirmAction } from './confirm.js'
@@ -222,7 +224,7 @@ const scheduleRender = (id) => {
       renderBody(key)
       /* 只有落在当前视图里的消息才驱动滚动，
          否则另一条线的流式输出会把用户正在看的位置拽走 */
-      const msg = state.messages.find((m) => m.id === key)
+      const msg = findMsg(key)
       if (msg && msg.channel === currentView()) scroll = true
       if (msg && msg.kind !== 'tool') applyFoldState(msg)
     }
@@ -273,7 +275,7 @@ function syncFoldStates () {
 
 function applyFoldState (input) {
   const msg = typeof input === 'string'
-    ? state.messages.find((item) => item.id === input)
+    ? findMsg(input)
     : input
   if (!msg) return
   const node = nodes.get(msg.id)
@@ -298,7 +300,7 @@ function applyFoldState (input) {
 }
 
 function toggleFold (id) {
-  const msg = state.messages.find((item) => item.id === id)
+  const msg = findMsg(id)
   if (!msg) return
   msg.folded = msg.streaming ? false : !msg.folded
   msg.foldManual = true
@@ -503,7 +505,7 @@ function head (msg) {
 }
 
 function renderBody (id) {
-  const msg = state.messages.find((m) => m.id === id)
+  const msg = findMsg(id)
   const node = nodes.get(id)
   if (!msg || !node) return
 
@@ -825,8 +827,9 @@ function createToolNode (msg) {
 
 function createNode (msg) {
   let node
+  const releasedCls = msg.ctxReleased ? ' released' : ''
   if (msg.kind === 'user') {
-    node = h('article', { class: 'msg user', dataset: { id: msg.id } })
+    node = h('article', { class: 'msg user' + releasedCls, dataset: { id: msg.id } })
   } else if (msg.kind === 'handoff') {
     node = createHandoffNode(msg)
   } else if (msg.kind === 'tool') {
@@ -848,7 +851,7 @@ function createNode (msg) {
     const live = msg.agentId ? state.roster.agents.find((a) => a.id === msg.agentId) : null
     const color = (live && live.color) || msg.color || 'var(--accent)'
     node = h('article', {
-      class: 'msg agent',
+      class: 'msg agent' + releasedCls,
       dataset: { id: msg.id, depth: msg.depth || 0 },
       style: { '--msg-color': color }
     },
@@ -878,6 +881,8 @@ function clearEmpty () {
 }
 
 function activeThread () {
+  /* 直连会话只有一条线，和项目会话的线程完全隔开 */
+  if (superChatActive()) return 'super'
   /* 单独会话只有一条线程：没点选时就是这条会话绑定的那一位。
      团队里没有总指挥的扁平编制落到第一个可用成员，不能固定成不存在的 'commander'。 */
   const fallback = conversationIsTeam() ? commander() : soloAgent()
@@ -885,10 +890,12 @@ function activeThread () {
 }
 
 /* 当前视图能看到哪些消息：
+   - 超级智能体：它自己的那条线，和项目消息互不相干
    - 用户 ↔ AI：本线程内、且只属于 user 通道
    - AI ↔ AI：所有 agent 通道消息，跨成员按时间顺序
-   两者互不交叉，任一侧都取不到另一侧的一条消息。 */
+   三者互不交叉，任一侧都取不到另一侧的一条消息。 */
 function viewMessages () {
+  if (superChatActive()) return superMessages()
   if (currentView() === 'agent') return messagesOf('agent')
   const thread = activeThread()
   return messagesOf('user').filter((m) => (m.thread || 'commander') === thread)
@@ -897,6 +904,10 @@ function viewMessages () {
 function showEmpty () {
   const el = streamEl()
   if (viewMessages().length) return
+  if (superChatActive()) {
+    el.append(superEmptyNode())
+    return
+  }
   if (currentView() === 'agent') {
     el.append(agentEmptyNode())
     return
@@ -977,7 +988,7 @@ function renderThread () {
 
 function refreshHeads () {
   for (const [id, node] of nodes) {
-    const msg = state.messages.find((m) => m.id === id)
+    const msg = findMsg(id)
     if (!msg) continue
     if (node.classList.contains('agent')) {
       const current = node.querySelector('.msg-head')
@@ -1009,6 +1020,19 @@ export function mountStream () {
   })
 
   bus.on('project:changed', () => {
+    autoScroll = true
+    renderThread()
+    playViewTransition(el)
+  })
+
+  /* 进出直连会话：同一条消息流换一条线，转场和切项目一致 */
+  bus.on('super:enter', () => {
+    autoScroll = true
+    renderThread()
+    playViewTransition(el)
+  })
+
+  bus.on('super:leave', () => {
     autoScroll = true
     renderThread()
     playViewTransition(el)
@@ -1077,31 +1101,33 @@ export function mountStream () {
   })
 
   bus.on('message:delta', ({ id }) => {
-    const msg = state.messages.find((m) => m.id === id)
+    const msg = findMsg(id)
     if (!msg || msg.kind !== 'agent') return
     setStatus(`「${agentLabel(msg.agentId)}」正在回复`, false)
   })
 
   bus.on('message:delta', ({ id, text }) => {
-    const msg = state.messages.find((m) => m.id === id)
+    const msg = findMsg(id)
     if (!msg) return
     msg.text = stripSummaryMarker((msg.text || '') + text)
     scheduleRender(id)
   })
 
   bus.on('message:update', ({ id, patch }) => {
-    const msg = state.messages.find((m) => m.id === id)
+    const msg = findMsg(id)
     if (!msg) return
     if (patch) Object.assign(msg, patch)
     const node = nodes.get(id)
     const ava = node && node.querySelector('.msg-ava')
     if (ava) ava.classList.toggle('busy', Boolean(msg.streaming))
+    /* 释放/恢复只改样式标记，不需要整条重绘 */
+    if (node) node.classList.toggle('released', Boolean(msg.ctxReleased))
     applyFoldState(msg)
     scheduleRender(id)
   })
 
   bus.on('message:done', ({ id }) => {
-    const msg = state.messages.find((m) => m.id === id)
+    const msg = findMsg(id)
     const node = nodes.get(id)
     if (!msg || !node) return
     msg.streaming = false
@@ -1111,7 +1137,7 @@ export function mountStream () {
   })
 
   bus.on('task:update', ({ msgId, taskId, patch }) => {
-    const msg = state.messages.find((m) => m.id === msgId)
+    const msg = findMsg(msgId)
     if (!msg || !msg.tasks) return
     const task = msg.tasks.find((t) => t.id === taskId)
     if (!task) return
@@ -1183,6 +1209,14 @@ function renderHints () {
   if (!hints || !hints.parentElement) return
   const input = $('#input')
   const value = (input.value || '').trim()
+  /* 直连会话的发送对象是它自己，和编制无关 */
+  if (superChatActive()) {
+    const profile = superProfile()
+    hints.textContent = ''
+    hints.append(h('span', { class: 'hint-target', style: { '--target-color': profile.color } },
+      '▸ ', h('b', {}, profile.name), ' 直连 · 不派单'))
+    return
+  }
   const match = /^@([^\s，,：:]+)/.exec(value)
   /* 单独会话默认就是那一位，不要退回总指挥，否则提示的名字和实际发送对象会不一致 */
   let target = conversationIsTeam() ? commander() : soloAgent()
@@ -1206,27 +1240,35 @@ function renderHints () {
 /* 协作区只读：输入区整体让位，发送入口一起收掉（不再额外弹出提示文案） */
 export function syncComposer () {
   const readonly = isReadonlyView()
+  const guest = isGuest()
+  const locked = readonly || guest
   const composer = $('.composer')
   const input = $('#input')
   const send = $('#btn-send')
   const toolbar = $('#toolbar')
 
-  if (composer) composer.classList.toggle('readonly', readonly)
+  if (composer) composer.classList.toggle('readonly', locked)
   if (input) {
-    input.disabled = readonly
+    input.disabled = locked
     if (readonly) input.value = ''
     input.placeholder = readonly
       ? ''
-      : (pluginModeOn() ? pluginPlaceholder() : '下达指令…（Enter 发送，Shift + Enter 换行）')
+      : guest
+        ? '游客为只读身份 · 请到「设置 → 个人资料」切换为管理员或成员'
+        : (superChatActive()
+            ? `和${superProfile().name}说话…（Enter 发送，Shift + Enter 换行）`
+            : (pluginModeOn() ? pluginPlaceholder() : '下达指令…（Enter 发送，Shift + Enter 换行）'))
     autoResize(input)
   }
   if (send) {
-    send.disabled = readonly
-    if (!readonly) send.textContent = state.busy ? '停止' : '发送'
-    send.classList.toggle('busy', !readonly && state.busy)
-    send.title = state.busy ? '停止本轮协作' : '发送'
+    /* 直连发送没有可中断的编排，忙的时候只能说「思考中」，不能说「停止」 */
+    const superBusy = Boolean(state.superChat.busy)
+    send.disabled = locked || superBusy
+    if (!locked) send.textContent = superBusy ? '思考中…' : (state.busy ? '停止' : '发送')
+    send.classList.toggle('busy', !locked && Boolean(state.busy))
+    send.title = guest ? '游客不能发起模型调用' : (state.busy ? '停止本轮协作' : '发送')
   }
-  if (toolbar) toolbar.classList.toggle('dimmed', readonly)
+  if (toolbar) toolbar.classList.toggle('dimmed', locked)
 }
 
 export function mountComposer () {
@@ -1238,7 +1280,7 @@ export function mountComposer () {
   let editingQuestion = false
 
   const setBusy = (busy) => {
-    send.disabled = isReadonlyView()
+    send.disabled = isReadonlyView() || isGuest()
     send.textContent = busy ? '停止' : '发送'
     send.classList.toggle('busy', busy)
     send.title = busy ? '停止本轮协作' : '发送'
@@ -1307,14 +1349,15 @@ export function mountComposer () {
       toast('协作区只读，切回「用户 ↔ AI」再发言', 'err')
       return
     }
-    if (!text || state.busy) return
+    if (!text || state.busy || state.superChat.busy) return
     send.classList.add('sent')
     setTimeout(() => send.classList.remove('sent'), 460)
     input.value = ''
     autoResize(input)
     renderHints()
     autoScroll = true
-    const res = await submit(text)
+    /* 直连会话不进编排：同样一个输入框，发出去的是「跟它说话」而不是派单 */
+    const res = superChatActive() ? await superSend(text) : await submit(text)
     if (res && res.ok === false) {
       if (editingQuestion) {
         input.value = text
@@ -1357,10 +1400,21 @@ export function mountComposer () {
     syncComposer()
   })
   bus.on('conversation:mode', () => syncComposer())
+  bus.on('role:changed', () => syncComposer())
   bus.on('project:changed', () => {
     if (editingQuestion) clearEditDraft()
     syncComposer()
   })
+  bus.on('super:enter', () => {
+    if (editingQuestion) clearEditDraft()
+    syncComposer()
+    renderHints()
+  })
+  bus.on('super:leave', () => {
+    syncComposer()
+    renderHints()
+  })
+  bus.on('super:busy', () => syncComposer())
 
   mountToolbar()
   autoResize(input)

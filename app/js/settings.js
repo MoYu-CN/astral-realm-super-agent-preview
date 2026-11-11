@@ -3,6 +3,7 @@
 import { state, bus, h, persist, toast, debounce, pickAvatar, uid, activeProject } from './core.js'
 import { openModal, field } from './modal.js'
 import { confirmAction } from './confirm.js'
+import { ROLES, roleId, roleInfo, roleMatrix } from './roles.js'
 import { addAgent } from './roster.js'
 import { renderTeamTemplates } from './team-templates.js'
 import { openTeamFromDocument } from './team-builder.js'
@@ -31,31 +32,45 @@ import { MODES, MAX_EVENTS } from './triggers-core.js'
 import { play as sfxPlay, config as sfxConfig, setConfig as setSfxConfig } from './sfx.js'
 import { availableLocales, currentLocale, setLocale, t } from './i18n.js'
 import { updateCard } from './updater.js'
+import { renderIntake } from './intake.js'
+import { renderSecurity } from './security.js'
 
 export function openSettings (tab = 'providers') {
+  const allTabs = [
+    { id: 'profile', label: '个人资料' },
+    { id: 'providers', label: '模型供应商' },
+    { id: 'roster', label: '编制' },
+    { id: 'templates', label: '团队模板' },
+    { id: 'permissions', label: '权限与数据' },
+    { id: 'intake', label: '消息接入' },
+    { id: 'security', label: '安全边界' },
+    { id: 'mcp', label: '工具（MCP）' },
+    { id: 'appearance', label: '外观' },
+    { id: 'run', label: '运行' },
+    { id: 'bridge', label: '外部接口' },
+    { id: 'about', label: '关于' }
+  ]
+  /* 非管理员只看得到资料、外观与关于：配置入口在渲染层就不出现，
+     主进程还会对保存动作再拒一次。 */
+  const tabs = roleId() === 'admin'
+    ? allTabs
+    : allTabs.filter((item) => ['profile', 'appearance', 'about'].includes(item.id))
+  const initial = tabs.some((item) => item.id === tab) ? tab : 'profile'
+
   openModal({
     title: '设置',
     sub: 'ASTRAL REALM · CONFIG',
     width: 820,
-    tab,
-    tabs: [
-      { id: 'profile', label: '个人资料' },
-      { id: 'providers', label: '模型供应商' },
-      { id: 'roster', label: '编制' },
-      { id: 'templates', label: '团队模板' },
-      { id: 'permissions', label: '权限与数据' },
-      { id: 'mcp', label: '工具（MCP）' },
-      { id: 'appearance', label: '外观' },
-      { id: 'run', label: '运行' },
-      { id: 'bridge', label: '外部接口' },
-      { id: 'about', label: '关于' }
-    ],
+    tab: initial,
+    tabs,
     render: (body, id) => {
       if (id === 'profile') renderProfile(body)
       else if (id === 'providers') renderProviders(body)
       else if (id === 'roster') renderRosterConfig(body)
       else if (id === 'templates') renderTeamTemplates(body, { onGenerate: () => openTeamFromDocument({ onSaved: () => openSettings('templates') }) })
       else if (id === 'permissions') renderPermissions(body)
+      else if (id === 'intake') renderIntake(body)
+      else if (id === 'security') renderSecurity(body)
       else if (id === 'mcp') renderMcpTools(body)
       else if (id === 'appearance') renderAppearance(body)
       else if (id === 'run') renderRun(body)
@@ -63,13 +78,164 @@ export function openSettings (tab = 'providers') {
       else renderAbout(body)
     }
   })
-  if (tab && tab !== 'providers') {
-    const btn = document.querySelector(`.modal-tabs button[data-tab="${tab}"]`)
+  if (initial && initial !== 'providers') {
+    const btn = document.querySelector(`.modal-tabs button[data-tab="${initial}"]`)
     if (btn) btn.click()
   }
 }
 
 /* --------------------------------------------------------- profile */
+
+function askPin ({ title, sub }) {
+  return new Promise((resolve) => {
+    let value = ''
+    openModal({
+      title,
+      sub,
+      width: 440,
+      onClose: () => resolve(null),
+      render: (box) => {
+        const input = h('input', {
+          class: 'input',
+          type: 'password',
+          placeholder: '管理员口令',
+          oninput: (e) => { value = e.target.value },
+          onkeydown: (e) => { if (e.key === 'Enter') submit() }
+        })
+        const submit = () => {
+          if (value.length < 4) { toast('口令至少 4 位', 'err'); return }
+          closeModal()
+          resolve(value)
+        }
+        box.append(
+          field('口令', input, '只保存 SHA-256 哈希，不保存明文'),
+          h('div', { class: 'btn-row', style: { marginTop: '12px' } },
+            h('button', { class: 'btn primary', onclick: submit }, '确认'),
+            h('button', { class: 'btn ghost', onclick: () => { closeModal(); resolve(null) } }, '取消')
+          )
+        )
+        setTimeout(() => input.focus(), 60)
+      }
+    })
+  })
+}
+
+async function switchRole (target) {
+  const profile = state.settings.profile || (state.settings.profile = {})
+  const current = roleId()
+  if (target === current) return
+
+  /* 降级前必须先有口令，否则切回来时没有任何凭据 */
+  if (target !== 'admin' && !profile.hasPin) {
+    toast('请先设置管理员口令：否则降级后本机无法切回管理员', 'err')
+    return
+  }
+
+  let pin = ''
+  if (target === 'admin') {
+    if (!profile.hasPin) {
+      toast('没有管理员口令：无法从成员/游客提升为管理员', 'err')
+      return
+    }
+    const entered = await askPin({
+      title: '切回管理员',
+      sub: '成员/游客可以浏览，但不能改设置或写记忆。回到管理员需要口令。'
+    })
+    if (entered === null) return
+    pin = entered
+  } else {
+    const ok = await confirmAction({
+      title: `切换为${roleInfo(target).label}？`,
+      message: `${roleInfo(target).desc}\n\n当前窗口会立即按新身份收窄按钮与输入框；切回管理员需要口令。`,
+      confirmText: '切换'
+    })
+    if (!ok) return
+  }
+
+  const res = await window.astral.roleSwitch({ role: target, pin })
+  if (!res || !res.ok) {
+    toast('切换失败：' + ((res && res.error) || '未知错误'), 'err')
+    return
+  }
+  profile.role = res.role
+  bus.emit('role:changed')
+  toast(`已切换为${roleInfo(res.role).label}`)
+  openSettings('profile')
+}
+
+function roleSection () {
+  const profile = state.settings.profile || (state.settings.profile = {})
+  const current = roleId()
+  const cards = ROLES.map((role) => h('button', {
+    class: 'role-card' + (role.id === current ? ' on' : ''),
+    type: 'button',
+    onclick: () => switchRole(role.id)
+  },
+  h('div', { class: 'role-card-head' },
+    h('strong', { text: role.label }),
+    h('span', { class: 'role-card-rank', text: role.id === 'admin' ? '最高' : role.id === 'member' ? '中' : '只读' })
+  ),
+  h('p', { text: role.desc })
+  ))
+
+  const rows = roleMatrix().map((row) => h('div', { class: 'role-matrix-row' },
+    h('span', { class: 'role-matrix-name', text: row.label }),
+    h('span', { class: row.admin ? 'yes' : 'no', text: row.admin ? '✓' : '—' }),
+    h('span', { class: row.member ? 'yes' : 'no', text: row.member ? '✓' : '—' }),
+    h('span', { class: row.guest ? 'yes' : 'no', text: row.guest ? '✓' : '—' })
+  ))
+
+  return h('div', { class: 'role-section' },
+    h('div', { class: 'label-main', style: { marginTop: '20px' }, text: '本机身份' }),
+    h('div', { class: 'hint', text: '身份决定界面按钮与主进程 IPC 的放行范围。它是本机边界，不是登录认证：能改 settings.json 的人仍然能改角色。' }),
+    h('div', { class: 'role-cards' }, ...cards),
+    h('div', { class: 'role-matrix' },
+      h('div', { class: 'role-matrix-row head' },
+        h('span', { class: 'role-matrix-name', text: '能力' }),
+        h('span', { text: '管理员' }),
+        h('span', { text: '成员' }),
+        h('span', { text: '游客' })
+      ),
+      ...rows
+    ),
+    h('div', { class: 'role-pin-row' },
+      h('button', {
+        class: 'btn ghost',
+        onclick: async () => {
+          const pin = await askPin({
+            title: profile.hasPin ? '修改管理员口令' : '设置管理员口令',
+            sub: '降级前必须先设置；切回管理员时要用它。'
+          })
+          if (pin === null) return
+          const res = await window.astral.roleSetPin({ pin })
+          if (!res || !res.ok) { toast('设置失败：' + ((res && res.error) || '未知错误'), 'err'); return }
+          profile.hasPin = true
+          toast('管理员口令已保存')
+          openSettings('profile')
+        }
+      }, profile.hasPin ? '修改口令' : '设置口令'),
+      profile.hasPin
+        ? h('button', {
+          class: 'btn ghost',
+          onclick: async () => {
+            const ok = await confirmAction({
+              title: '清除管理员口令？',
+              message: '清除后，从成员或游客身份将无法自助切回管理员；只能手动改 settings.json。',
+              confirmText: '清除',
+              danger: true
+            })
+            if (!ok) return
+            const res = await window.astral.roleSetPin({ pin: '' })
+            if (!res || !res.ok) { toast('清除失败', 'err'); return }
+            profile.hasPin = false
+            toast('已清除管理员口令')
+            openSettings('profile')
+          }
+        }, '清除口令')
+        : h('span', { class: 'hint', text: '尚未设置：当前不能在成员/游客之间切换' })
+    )
+  )
+}
 
 function renderProfile (body) {
   const profile = state.settings.profile || (state.settings.profile = { name: '', short: '', avatar: '', likes: '' })
@@ -129,7 +295,8 @@ function renderProfile (body) {
       field('简称', shortInput, '消息右侧显示')
     ),
     field('喜好与背景', likesArea, '会写进每个成员的系统提示词，让他们按你的习惯说话。'),
-    h('div', { class: 'hint', text: '改完即时保存，下一轮对话生效。' })
+    h('div', { class: 'hint', text: '改完即时保存，下一轮对话生效。' }),
+    roleSection()
   )
 }
 
@@ -866,7 +1033,7 @@ function renderRosterConfig (body) {
     state.roster.globalNotes = notes.value
     persist.roster()
   }, 500))
-  body.append(notes, h('div', { class: 'hint', text: '这里写的内容只会注入到当前项目成员的提示词里，适合放项目背景、术语表、硬性约束。' }))
+  body.append(notes, h('div', { class: 'hint', text: '这里写的内容只会注入到当前项目成员的提示词里，适合放项目背景、术语表、硬性约束。也可以在右侧「上下文」面板点「✦ 沉淀」，让总指挥从会话里提炼。' }))
 
   body.append(h('div', { class: 'pane-title', style: { marginTop: '18px' }, text: '成员管理' }))
   const counts = { commander: 0, deputy: 0, executor: 0 }

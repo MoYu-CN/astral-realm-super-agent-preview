@@ -128,8 +128,16 @@
           <strong>星界</strong>
           <span>ASTRAL REALM</span>
         </div>
+        <button class="brand-role" id="role-badge" type="button" title="当前身份与权限边界">管理员</button>
       </div>
       <div class="project-tree" id="project-tree"></div>
+      <button class="rail-super" id="btn-super" type="button" aria-current="false" title="和超级智能体说话（直连，不经过派单）">
+        <span class="rail-super-mark" aria-hidden="true">✦</span>
+        <span class="rail-super-text">
+          <strong id="rail-super-name">星核</strong>
+          <em>直连会话</em>
+        </span>
+      </button>
       <div class="rail-scroll" id="roster"></div>
       <div class="rail-foot">
         <button class="ghost-btn" id="btn-settings">设 置</button>
@@ -158,6 +166,7 @@
           <button class="chip" id="btn-renew" title="总结当前会话，开启干净上下文的新会话">革新</button>
           <button class="chip" id="btn-search" title="搜索当前项目会话（Ctrl+K）">搜索</button>
           <button class="chip" id="btn-theme">主题</button>
+          <button class="chip" id="btn-memory" title="打开记忆库控制台（项目 · 事件 · 派发记录）">记忆</button>
           <button class="chip" id="btn-dock">面板</button>
           <span class="bridge" id="bridge-badge" title="MCP 桥接状态">
             <i class="node"></i>
@@ -172,6 +181,16 @@
           <button id="win-close" title="关闭" aria-label="关闭">✕</button>
         </div>
       </header>
+
+      <div class="time-nudge" id="time-nudge" hidden>
+        <span class="time-nudge-mark" aria-hidden="true">✦</span>
+        <div class="time-nudge-body">
+          <strong id="time-nudge-title">这个时段你通常在推进一个项目</strong>
+          <span id="time-nudge-sub"></span>
+        </div>
+        <button class="time-nudge-go" id="time-nudge-go" type="button">帮我起个头</button>
+        <button class="time-nudge-off" id="time-nudge-off" type="button" title="今天不再提醒">今天不用</button>
+      </div>
 
       <div class="stream" id="stream"></div>
 

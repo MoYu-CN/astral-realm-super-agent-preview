@@ -491,6 +491,58 @@ test('conversation auto-fold keeps the latest three pinned and folds older ones'
   }
 })
 
+test('运行中释放：被释放的消息退出模型上下文，可恢复，标记随消息持久化', async () => {
+  const tmp = path.join(os.tmpdir(), `astral-release-${process.pid}.mjs`)
+  try {
+    fs.copyFileSync(path.join(__dirname, '..', 'app', 'js', 'context-release.js'), tmp)
+    const { pathToFileURL } = require('node:url')
+    const { isContextReleased, toggleContextRelease, liveMessages, releasedStats } =
+      await import(pathToFileURL(tmp).href)
+
+    const messages = [
+      { id: 'm1', kind: 'user', text: '第一问' },
+      { id: 'm2', kind: 'agent', text: '第一答，比较长的回复内容' },
+      { id: 'm3', kind: 'user', text: '第二问' },
+      { id: 'm4', kind: 'agent', text: '第二答' }
+    ]
+
+    /* 默认全在上下文里 */
+    assert.equal(liveMessages(messages).length, 4)
+    assert.deepEqual(releasedStats(messages, (m) => m.text.length), { count: 0, tokens: 0 })
+
+    /* 释放单条：反转语义 */
+    assert.equal(toggleContextRelease(messages[0]), true)
+    assert.equal(isContextReleased(messages[0]), true)
+    assert.equal(liveMessages(messages).length, 3)
+    assert.ok(!liveMessages(messages).some((m) => m.id === 'm1'))
+
+    /* 指定释放/恢复：批量路径用同一个入口 */
+    toggleContextRelease(messages[1], true)
+    toggleContextRelease(messages[2], true)
+    assert.equal(liveMessages(messages).length, 1)
+    const stats = releasedStats(messages, (m) => m.text.length)
+    assert.equal(stats.count, 3)
+    assert.equal(stats.tokens, '第一问'.length + '第一答，比较长的回复内容'.length + '第二问'.length)
+
+    toggleContextRelease(messages[1], false)
+    assert.equal(isContextReleased(messages[1]), false)
+    assert.equal(liveMessages(messages).length, 2)
+
+    /* 序列化往返：ctxReleased 作为普通字段随会话存档，重载后仍然生效 */
+    const saved = JSON.parse(JSON.stringify(messages))
+    assert.equal(saved[0].ctxReleased, true)
+    assert.equal(saved[3].ctxReleased, undefined)
+    assert.equal(liveMessages(saved).length, 2)
+
+    /* 空值不炸 */
+    assert.equal(isContextReleased(null), false)
+    assert.equal(toggleContextRelease(null), false)
+    assert.deepEqual(liveMessages(null), [])
+  } finally {
+    try { fs.rmSync(tmp, { force: true }) } catch { /* ignore */ }
+  }
+})
+
 test('build info detects a stale running process after files change on disk', () => {
   const dir = tempDir()
   try {
@@ -830,6 +882,139 @@ test('关于页挂载更新卡片，IPC 通道与 preload 对齐', () => {
   assert.match(preload, /checkUpdate: .*'astral:update:check'/)
   const main = fs.readFileSync(path.join(root, 'electron', 'main.js'), 'utf8')
   assert.match(main, /ipcMain\.handle\('astral:update:check'/)
+})
+
+test('探子：只读扫描项目目录，跳过依赖与隐藏文件，拒绝整个个人目录', async () => {
+  const scout = require('../electron/scout.js')
+  const dir = tempDir()
+  try {
+    fs.mkdirSync(path.join(dir, 'src'))
+    fs.writeFileSync(path.join(dir, 'README.md'), '# 投票项目\n登录模块')
+    fs.writeFileSync(path.join(dir, 'src', 'a.js'), 'export const a = 1')
+    fs.mkdirSync(path.join(dir, 'node_modules'))
+    fs.writeFileSync(path.join(dir, 'node_modules', 'junk.js'), 'skip me')
+    fs.writeFileSync(path.join(dir, '.hidden.md'), 'skip me too')
+    const res = await scout.scan({ rootPath: dir })
+    assert.equal(res.ok, true)
+    assert.equal(res.stats.scanned, 2)
+    assert.ok(res.files.some((file) => file.path === 'README.md'))
+    assert.ok(!res.files.some((file) => file.path.includes('node_modules')))
+    assert.match(res.digest, /投票项目/)
+    assert.equal((await scout.scan({ rootPath: '' })).ok, false)
+    assert.equal((await scout.scan({ rootPath: path.join(dir, 'no-such') })).ok, false)
+    /* 只读：源文件原样保留 */
+    assert.equal(fs.readFileSync(path.join(dir, 'README.md'), 'utf8'), '# 投票项目\n登录模块')
+    const desktop = path.join(os.homedir(), 'Desktop')
+    if (fs.existsSync(desktop)) {
+      const denied = await scout.scan({ rootPath: desktop })
+      assert.equal(denied.ok, false)
+      assert.match(denied.error, /个人目录/)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })
+  }
+})
+
+test('探子与观察链路：IPC / preload / 工具对齐', () => {
+  const root = path.join(__dirname, '..')
+  const main = fs.readFileSync(path.join(root, 'electron', 'main.js'), 'utf8')
+  const preload = fs.readFileSync(path.join(root, 'electron', 'preload.js'), 'utf8')
+  const mcp = fs.readFileSync(path.join(root, 'electron', 'mcp-client.js'), 'utf8')
+  const gateway = fs.readFileSync(path.join(root, 'electron', 'tool-gateway.js'), 'utf8')
+  assert.match(main, /ipcMain\.handle\('astral:scout:scan'/)
+  assert.match(main, /ipcMain\.handle\('astral:memory:commitScout'/)
+  assert.match(preload, /scoutScan: .*'astral:scout:scan'/)
+  assert.match(preload, /memoryCommitScout: .*'astral:memory:commitScout'/)
+  assert.match(mcp, /name: 'memory_observe'/)
+  assert.match(gateway, /case 'memory_observe'/)
+})
+
+test('超级会话：用户保留完整记录，模型只读取未隐藏消息与事件精华', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'super-memory.js'), 'utf8')
+  const mod = await import(`data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`)
+  const messages = [
+    { id: 'u1', role: 'user', text: '完整提问一' },
+    { id: 'a1', role: 'assistant', text: '完整回复一' },
+    { id: 'u2', role: 'user', text: '完整提问二', contextHidden: true },
+    { id: 'a2', role: 'assistant', text: '完整回复二', contextHidden: true },
+    { id: 'u3', role: 'user', text: '手动释放', ctxReleased: true }
+  ]
+  assert.deepEqual(mod.modelHistory(messages), [
+    { role: 'user', content: '完整提问一' },
+    { role: 'assistant', content: '完整回复一' }
+  ])
+  assert.equal(mod.hideExchange(messages, ['u1', 'a1']), 2)
+  assert.equal(messages[0].contextHidden, true)
+  assert.equal(mod.modelHistory(messages).length, 0)
+  assert.equal(messages[2].text, '完整提问二', '用户视图的完整消息不能被删除')
+
+  const memory = mod.normalizeMemory([
+    { ts: 0, text: '旧记忆' },
+    { ts: 1, text: '新记忆' }
+  ], { maxChars: 4 })
+  assert.deepEqual(memory.map((item) => item.text), ['新记忆'])
+
+  const range = mod.timeRangeForQuery('昨天那个项目到哪了', new Date(2026, 10, 11, 12, 0, 0).getTime())
+  assert.equal(range.label, '昨天')
+  assert.ok(new Date(range.from) < new Date(range.to))
+  const recalled = mod.formatRecalledEvents([
+    { project: '示例项目', summary: '完成登录修复', result: '完成', startedAt: range.from }
+  ], [], range)
+  assert.match(recalled, /时间范围：昨天/)
+  assert.match(recalled, /示例项目：完成登录修复/)
+})
+
+test('超级会话接线：原文入库、事件精华入库、消息链接、可引用原文', () => {
+  const root = path.join(__dirname, '..')
+  const superSrc = fs.readFileSync(path.join(root, 'app', 'js', 'superagent.js'), 'utf8')
+  assert.match(superSrc, /extractEssence/)
+  assert.match(superSrc, /writeEssenceEvent/)
+  assert.match(superSrc, /saveMessageRecord/)
+  assert.match(superSrc, /messageDigest/)
+  assert.match(superSrc, /memoryQuery/)
+  assert.match(superSrc, /hideExchange/)
+  assert.match(superSrc, /saveSuperSession\(\{ messages, memory \}\)/)
+  const main = fs.readFileSync(path.join(root, 'electron', 'main.js'), 'utf8')
+  assert.match(main, /ipcMain\.handle\('astral:memory:query'/)
+  assert.match(main, /ipcMain\.handle\('astral:message:record'/)
+  assert.match(main, /ipcMain\.handle\('astral:message:digest'/)
+  assert.match(main, /message-fallback\.jsonl/)
+  assert.match(main, /memory: \(Array\.isArray\(data && data\.memory\)/)
+  assert.match(main, /version: 2, updatedAt: Date\.now\(\), messages, memory/)
+  const actions = fs.readFileSync(path.join(root, 'app', 'js', 'message-actions.js'), 'utf8')
+  assert.match(actions, /quoteOriginalForTarget/)
+  assert.match(actions, /引用原文/)
+})
+
+test('消息原文只追加、浓缩记忆链接原文，权重可由打分方动态写入', () => {
+  const dir = tempDir()
+  try {
+    const { createMemoryService, ROLE } = require('../electron/memory/index.js')
+    const service = createMemoryService({ configDir: dir, enabled: true })
+    try {
+      const first = service.writeMessageRecord({
+        actor: ROLE.SUPER, id: 'm1', conversationId: 'c1', role: 'user', text: '完整原文一'
+      })
+      assert.equal(first.ok, true)
+      service.writeMessageRecord({
+        actor: ROLE.SUPER, id: 'm1', conversationId: 'c1', role: 'user', text: '试图篡改'
+      })
+      const original = service.getMessageRecord({ actor: ROLE.SUPER, id: 'm1' })
+      assert.equal(original.data.text, '完整原文一', '原文不允许被覆盖')
+      const digest = service.writeMessageDigest({
+        actor: ROLE.SUPER, messageId: 'm1', conversationId: 'c1', digest: '浓缩版本',
+        weight: 0.62, weightJson: { time: 0.8, result: 0.4 }, scorer: 'main'
+      })
+      assert.equal(digest.ok, true)
+      assert.equal(digest.data.message_id, 'm1')
+      assert.equal(digest.data.weight, 0.62)
+      const list = service.queryMessageDigests({ actor: ROLE.SUPER, conversationId: 'c1' })
+      assert.equal(list.data.length, 1)
+      assert.equal(list.data[0].digest, '浓缩版本')
+    } finally { service.close() }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })
+  }
 })
 
 ;(async () => {

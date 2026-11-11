@@ -3,12 +3,14 @@
 import {
   state, bus, h, $, uid, toast, activeProject, loadMessages, normalizeContextSpec,
   syncActiveProject, saveProjectsNow, saveProjectSessionNow, sessionPayload,
-  normalizeConversationMode, normalizeConversationTitle
+  normalizeConversationMode, normalizeConversationTitle, superChatActive
 } from './core.js'
 import { openModal, closeModal, field } from './modal.js'
 import { confirmAction } from './confirm.js'
 import { icon } from './icons.js'
 import { instantiateTemplate, templateSummary } from './team-templates.js'
+import { leaveSuperChat } from './superagent.js'
+import { openScout } from './scout.js'
 
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/
 
@@ -161,6 +163,8 @@ export async function switchProject (id) {
     return false
   }
   if (switching) return false
+  /* 直连会话是叠在当前项目上的一条线：点任何项目都先回到项目会话 */
+  if (superChatActive()) leaveSuperChat()
   if (id === state.activeProjectId) return true
   const target = state.projects.find((p) => p.id === id)
   if (!target || target.archivedAt) return false
@@ -351,6 +355,42 @@ export function openArchivedProjects () {
       }
     }
   })
+}
+
+/* 项目设置里顺手把权重网里和它相连的项目列出来：
+   星图上看连线与百分比，这里给出可复制的名字与排序。 */
+async function loadProjectRelations (name, root) {
+  if (!window.astral || typeof window.astral.memoryNet !== 'function') return
+  let result
+  try { result = await window.astral.memoryNet() } catch { return }
+  const data = result && result.data
+  if (!data || !Array.isArray(data.links)) return
+  const nodes = new Map((data.nodes || []).map((node) => [node.id, node.name || node.id]))
+  const related = data.links
+    .map((link) => {
+      const other = link.a === name ? link.b : (link.b === name ? link.a : null)
+      if (!other) return null
+      return {
+        name: nodes.get(other) || other,
+        percent: Math.round((link.weight || 0) * 100),
+        hits: link.hits || 0
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.percent - a.percent)
+    .slice(0, 5)
+  root.textContent = ''
+  if (!related.length) {
+    root.append(h('div', { class: 'hint', text: '这张网里还没有与它相连的项目；一起被回忆几次后会自动连上。' }))
+    return
+  }
+  for (const item of related) {
+    root.append(h('div', { class: 'project-rel-row', title: `一起被回忆 ${item.hits} 次` },
+      h('span', { class: 'project-rel-name', text: item.name }),
+      h('div', { class: 'project-rel-bar' }, h('i', { style: { width: item.percent + '%' } })),
+      h('span', { class: 'project-rel-pct', text: item.percent + '%' })
+    ))
+  }
 }
 
 function conversationModeLabel (project) {
@@ -587,6 +627,17 @@ export function openProjectDialog (project = null) {
               : h('div', { class: 'hint', text: '这个项目还没有成员。' })
           ), '成员与总指挥/副指挥角色在切换到该项目后，到 设置 → 编制 中调整。')
         )
+        const relatedBox = h('div', { class: 'project-related' })
+        rows.push(field('相关项目 · 权重网', relatedBox,
+          '按内容近似与一起回忆的次数算；控制台「星图」里点开这个项目，连线上会写出同样的百分比。'))
+        loadProjectRelations(project.name, relatedBox)
+        rows.push(field('探子 · 快速搭建权重网',
+          h('button', {
+            class: 'btn ghost',
+            type: 'button',
+            onclick: () => { closeModal(); setTimeout(() => openScout(project), 0) }
+          }, '扫描项目文件'),
+          '只读扫描项目目录 → 摘要 → 超级智能体整理 → 写入权重网；不改动任何文件。'))
       }
 
       body.append(

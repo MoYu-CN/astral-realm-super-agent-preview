@@ -46,11 +46,13 @@ const EXE_DIR = (() => {
   try { return path.dirname(app.getPath('exe')) } catch { return null }
 })()
 const PORTABLE = Boolean(EXE_DIR && fs.existsSync(path.join(EXE_DIR, 'portable.flag')))
-const CONFIG_DIR = DEV
-  ? path.join(ROOT, 'config')
-  : PORTABLE
-    ? path.join(EXE_DIR, 'config')
-    : path.join(app.getPath('userData'), 'config')
+const CONFIG_DIR = process.env.ASTRAL_CONFIG_DIR
+  ? path.resolve(process.env.ASTRAL_CONFIG_DIR)
+  : DEV
+    ? path.join(ROOT, 'config')
+    : PORTABLE
+      ? path.join(EXE_DIR, 'config')
+      : path.join(app.getPath('userData'), 'config')
 const SESSION_FILE = path.join(CONFIG_DIR, 'session.json')
 const runStore = createRunStore({ configDir: CONFIG_DIR })
 /* runId → 能力令牌。只在主进程内存中；渲染层从 runStart 的返回值拿到当前 run 的令牌。
@@ -84,7 +86,12 @@ async function getKnowledgeService () {
     const { pathToFileURL } = require('node:url')
     const moduleUrl = pathToFileURL(path.join(__dirname, 'knowledge', 'service.mjs')).href
     knowledgeServicePromise = import(moduleUrl)
-      .then((mod) => mod.createKnowledgeService({ configDir: CONFIG_DIR }))
+      /* 知识库把「权重」这件事交给记忆库的第四张网：索引存在 memory.db 里，
+         文件仍是正文的唯一真相。记忆库被关掉时传 null，知识库自动退回关键词检索。 */
+      .then((mod) => mod.createKnowledgeService({
+        configDir: CONFIG_DIR,
+        memory: () => (memoryHost.enabled() ? memoryHost.getService() : null)
+      }))
       .catch((err) => {
         knowledgeServicePromise = null
         throw err
@@ -163,6 +170,32 @@ async function captureScreenshot ({ target = 'screen' } = {}) {
   }
 }
 
+const { createMemoryHost } = require('./memory/host.js')
+
+/* 记忆库：主进程内嵌读写 + 按需拉起控制台；开关在 settings.json → memory.enabled */
+const memoryHost = createMemoryHost({
+  configDir: CONFIG_DIR,
+  viewServerPath: path.join(__dirname, 'memory', 'view-server.js'),
+  logger: (line) => { if (process.env.ASTRAL_DEBUG) console.log(line) }
+})
+
+/* 消息接入：与记忆库共用同一个 SQLite，密钥单独加密存放。
+   渠道实现全在 intake/adapters/，这里只负责把「谁在收」接到界面上。 */
+const { createIntake } = require('./intake/index.js')
+const { createSecretBox } = require('./intake/secret-box.js')
+const intake = createIntake({
+  configDir: CONFIG_DIR,
+  secretBox: createSecretBox({ configDir: CONFIG_DIR }),
+  store: {
+    inbox: (input) => {
+      const service = memoryHost.getService()
+      if (!service) return { ok: false, error: '记忆库已关闭' }
+      return service.inbox(input)
+    }
+  },
+  log: (line) => { if (process.env.ASTRAL_DEBUG) console.log('[intake]', line) }
+})
+
 const { createMcpRegistry } = require('./mcp-client.js')
 const mcpRegistry = createMcpRegistry({
   configDir: CONFIG_DIR,
@@ -180,6 +213,8 @@ const mcpRegistry = createMcpRegistry({
     return service.runTool(tool, args, project)
   },
   knowledgeEnabled: knowledgePluginEnabled,
+  memory: (tool, args) => memoryHost.runTool(tool, args),
+  memoryEnabled: () => memoryHost.enabled(),
   /* 工具执行端只认主进程签发的一次性令牌。 */
   verifyApproval: (token, call) => toolApprovals.consume(token, call)
 })
@@ -283,6 +318,93 @@ function registerAppProtocol () {
 /* ---------------------------------------------------------------- config */
 
 const CONFIG_FILES = ['settings.json', 'providers.json', 'roster.json', 'projects.json', 'team-templates.json']
+
+/* ---------------------------------------------------------------- 角色边界
+ * settings.json → profile.role 是本机身份的唯一来源。
+ * 渲染层会隐藏按钮，但按钮可以被绕过；这里对敏感 IPC 再判一次。
+ * 默认 admin：老配置没有这个字段时，已有用户体验不变。
+ */
+const ROLE_RANK = { guest: 1, member: 2, admin: 3 }
+const ROLE_CAPS = {
+  chat: ['admin', 'member'],
+  tools: ['admin', 'member'],
+  'files.write': ['admin', 'member'],
+  'project.manage': ['admin', 'member'],
+  'job.manage': ['admin', 'member'],
+  'knowledge.write': ['admin', 'member'],
+  'memory.read': ['admin', 'member'],
+  'memory.console': ['admin', 'member'],
+  'memory.write': ['admin'],
+  settings: ['admin'],
+  providers: ['admin'],
+  roster: ['admin'],
+  'plugins.manage': ['admin'],
+  'role.manage': ['admin']
+}
+
+function roleSnapshot () {
+  const settings = readSettingsFile()
+  const id = settings && settings.profile && settings.profile.role
+  return ROLE_RANK[id] ? id : 'admin'
+}
+
+function readSettingsFile () {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, 'settings.json'), 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+function pinHash (pin) {
+  return crypto.createHash('sha256').update(String(pin || '')).digest('hex')
+}
+
+function roleCan (cap) {
+  const allowed = ROLE_CAPS[cap]
+  if (!allowed) return false
+  return allowed.includes(roleSnapshot())
+}
+
+function deny (cap) {
+  const label = { admin: '管理员', member: '成员', guest: '游客' }[roleSnapshot()] || roleSnapshot()
+  return { ok: false, denied: true, error: `权限拒绝：当前身份「${label}」无权执行 ${cap}` }
+}
+
+/* 非管理员保存 settings.json 时，敏感段一律沿用磁盘上的值。
+   否则成员只要把 profile.role 改成 admin、或把 permissions.full 打开，
+   就能绕过整套边界。 */
+const SETTINGS_LOCKED = [
+  'permissions', 'agentDefaults', 'superAgent', 'memory', 'bridge',
+  'triggers', 'plugins', 'retry', 'speech'
+]
+
+function sanitizeSettingsForRole (incoming, role) {
+  if (!incoming || typeof incoming !== 'object') return incoming
+  let stored = {}
+  try { stored = readSettingsFile() } catch { /* 首次写入 */ }
+  const next = { ...incoming }
+
+  /* 口令哈希只留在主进程：渲染层永远拿不到，也不能通过普通保存覆盖它 */
+  if (next.profile && typeof next.profile === 'object') {
+    next.profile = { ...next.profile }
+    delete next.profile.rolePin
+    delete next.profile.hasPin
+    if (stored.profile && stored.profile.rolePin) next.profile.rolePin = stored.profile.rolePin
+  }
+
+  if (role === 'admin') return next
+  for (const key of SETTINGS_LOCKED) {
+    if (stored[key] !== undefined) next[key] = stored[key]
+    else delete next[key]
+  }
+  const keepRole = stored.profile && ROLE_RANK[stored.profile.role] ? stored.profile.role : 'admin'
+  next.profile = { ...(stored.profile || {}), ...(incoming.profile || {}), role: keepRole }
+  delete next.profile.rolePin
+  delete next.profile.hasPin
+  if (stored.profile && stored.profile.rolePin) next.profile.rolePin = stored.profile.rolePin
+  return next
+}
 const PROJECT_SESSIONS_DIR = () => path.join(CONFIG_DIR, 'projects')
 
 async function ensureConfig () {
@@ -385,6 +507,7 @@ async function findConfigSkillFile (id) {
 }
 
 ipcMain.handle('astral:skills:upload', async () => {
+  if (!roleCan('roster')) return deny('roster')
   try {
     const scriptedSource = String(process.env.ASTRAL_SKILL_UPLOAD_SOURCE || '').trim()
     let source = scriptedSource
@@ -438,6 +561,7 @@ ipcMain.handle('astral:skills:upload', async () => {
 })
 
 ipcMain.handle('astral:skills:delete', async (_event, payload = {}) => {
+  if (!roleCan('roster')) return deny('roster')
   try {
     const id = String(payload.id || '').trim()
     if (!SKILL_ID_RE.test(id)) return { ok: false, error: '技能 id 无效' }
@@ -990,6 +1114,7 @@ async function providerWithKey (provider = {}) {
 }
 
 ipcMain.handle('astral:llm:start', async (event, payload) => {
+  if (!roleCan('chat')) throw new Error(deny('chat').error)
   const id = payload.id
   const sender = event.sender
   const controller = new AbortController()
@@ -1104,6 +1229,344 @@ ipcMain.handle('astral:llm:test', async (_event, payload) => {
 
 /* ------------------------------------------------------- mcp client (工具) */
 
+ipcMain.handle('astral:memory:status', async () => memoryHost.status())
+ipcMain.handle('astral:memory:prompt', async () => {
+  if (!roleCan('memory.read')) {
+    return { ...deny('memory.read'), text: '', blocks: [], total: 0, budget: 0, filled: 0 }
+  }
+  return memoryHost.prompt()
+})
+ipcMain.handle('astral:memory:setEnabled', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  const next = memoryHost.setEnabled(payload.enabled !== false)
+  if (!next.enabled && memoryWindow && !memoryWindow.isDestroyed()) memoryWindow.close()
+  return next
+})
+/* 按权重网回忆：只读，成员可用；游客与未启用记忆库时返回空结果 */
+ipcMain.handle('astral:memory:recall', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) {
+    return { ...deny('memory.read'), projects: [], events: [], knowledge: [], text: '' }
+  }
+  return memoryHost.recall(payload)
+})
+/* 时间过滤直接查事件表；只读，用于“昨天某某项目到哪了”这类回查 */
+ipcMain.handle('astral:memory:query', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) {
+    return { ...deny('memory.read'), ok: false, events: [] }
+  }
+  return memoryHost.runTool('memory_query', payload || {})
+})
+/* 超级智能体任务结束后写一条精华事件；正文不在这里写 */
+ipcMain.handle('astral:memory:write', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  if (!payload || payload.action !== 'event') {
+    return { ok: false, error: '超级智能体只允许写入 event' }
+  }
+  return memoryHost.runTool('memory_write', payload)
+})
+
+/* 消息原文与浓缩记忆：原文表只追加；浓缩表链接原文 ID。
+   数据库不可用时先落临时 JSONL，恢复后再迁回。 */
+const MESSAGE_FALLBACK_FILE = () => path.join(CONFIG_DIR, 'super-agent', 'message-fallback.jsonl')
+
+async function appendMessageFallback (kind, payload) {
+  const file = MESSAGE_FALLBACK_FILE()
+  await fsp.mkdir(path.dirname(file), { recursive: true })
+  await fsp.appendFile(file, JSON.stringify({ kind, payload }) + '\n', 'utf8')
+}
+
+async function readMessageFallback () {
+  try {
+    const text = await fsp.readFile(MESSAGE_FALLBACK_FILE(), 'utf8')
+    return text.split(/\r?\n/).filter(Boolean).map((line) => {
+      try { return JSON.parse(line) } catch { return null }
+    }).filter(Boolean)
+  } catch { return [] }
+}
+
+async function flushMessageFallback () {
+  const rows = await readMessageFallback()
+  if (!rows.length || !memoryHost.enabled()) return
+  const keep = []
+  for (const row of rows) {
+    let result
+    try {
+      if (row.kind === 'record') result = memoryHost.messageRecord(row.payload || {})
+      else if (row.kind === 'digest') result = memoryHost.messageDigest(row.payload || {})
+      else result = { ok: true }
+    } catch (err) {
+      result = { ok: false, error: err.message }
+    }
+    if (!result || !result.ok) keep.push(JSON.stringify(row))
+  }
+  const file = MESSAGE_FALLBACK_FILE()
+  if (keep.length) await fsp.writeFile(file, keep.join('\n') + '\n', 'utf8')
+  else await fsp.unlink(file).catch(() => {})
+}
+
+ipcMain.handle('astral:message:record', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  const result = memoryHost.messageRecord(payload || {})
+  if (result && result.ok) {
+    flushMessageFallback().catch(() => {})
+    return result
+  }
+  try {
+    await appendMessageFallback('record', payload || {})
+    return { ok: true, pending: true, fallback: true }
+  } catch (err) {
+    return { ok: false, error: (result && result.error) || err.message }
+  }
+})
+
+ipcMain.handle('astral:message:digest', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  const result = memoryHost.messageDigest(payload || {})
+  if (result && result.ok) {
+    flushMessageFallback().catch(() => {})
+    return result
+  }
+  try {
+    await appendMessageFallback('digest', payload || {})
+    return { ok: true, pending: true, fallback: true }
+  } catch (err) {
+    return { ok: false, error: (result && result.error) || err.message }
+  }
+})
+
+ipcMain.handle('astral:message:get', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  const result = memoryHost.messageGet(payload || {})
+  if (result && result.ok) return result
+  const id = String(payload.id || payload.messageId || '')
+  const rows = await readMessageFallback()
+  const hit = rows.find((row) => row.kind === 'record' && row.payload && row.payload.id === id)
+  return hit ? { ok: true, data: hit.payload, fallback: true } : result
+})
+
+ipcMain.handle('astral:message:digests', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  const result = memoryHost.messageDigests(payload || {})
+  if (result && result.ok) return result
+  const rows = await readMessageFallback()
+  const conversationId = String(payload.conversationId || payload.conversation_id || '')
+  const data = rows
+    .filter((row) => row.kind === 'digest' && row.payload &&
+      (!conversationId || row.payload.conversationId === conversationId))
+    .map((row) => row.payload)
+  return { ok: true, data, fallback: true }
+})
+/* 项目镜像：把左侧项目列表同步成权重网节点，元数据级写入，不涉及正文 */
+ipcMain.handle('astral:memory:syncProjects', async (_event, payload = {}) => {
+  if (!roleCan('chat')) return deny('chat')
+  return memoryHost.syncProjects(Array.isArray(payload.projects) ? payload.projects : [])
+})
+/* 时间网：周记与时段习惯。读路径会顺手刷新派生表，不写任何记录 */
+ipcMain.handle('astral:memory:time', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) {
+    return { ...deny('memory.read'), found: false, rows: [], weeks: [], grid: [] }
+  }
+  return memoryHost.time(payload)
+})
+/* 知识网索引：超级智能体只看索引，正文归项目知识库 */
+ipcMain.handle('astral:memory:kb', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), ok: false }
+  return memoryHost.kb(payload || {})
+})
+ipcMain.handle('astral:memory:net', async () => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), nodes: [], links: [], stats: {} }
+  return memoryHost.net()
+})
+/* 探子：只读扫描用户明确指定的项目目录；个人目录在 scout.js 里再挡一层 */
+ipcMain.handle('astral:scout:scan', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) {
+    return { ...deny('memory.read'), files: [], digest: '', stats: {} }
+  }
+  return memoryHost.scan(payload || {})
+})
+/* 超级智能体整理后的摘要写入权重网：写库，管理员限定 */
+ipcMain.handle('astral:memory:commitScout', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  return memoryHost.commitScout(payload || {})
+})
+ipcMain.handle('astral:memory:openConsole', async (_event, payload = {}) => {
+  if (!roleCan('memory.console')) return deny('memory.console')
+  return openMemoryConsole(payload)
+})
+ipcMain.handle('astral:memory:closeConsole', async () => {
+  memoryHost.stopConsole()
+  return { ok: true }
+})
+
+/* 消息接入：渠道管理与收件箱。所有渠道走同一套接口，用户自己决定开哪条 */
+ipcMain.handle('astral:intake:list', async () => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), channels: [] }
+  return { ok: true, channels: intake.list(), port: intake.port() }
+})
+ipcMain.handle('astral:intake:catalog', async () => ({ ok: true, kinds: intake.catalog() }))
+ipcMain.handle('astral:intake:save', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  return intake.saveChannel(payload || {})
+})
+ipcMain.handle('astral:intake:remove', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  return intake.removeChannel(payload.id)
+})
+ipcMain.handle('astral:intake:enable', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  return intake.setEnabled(payload.id, payload.enabled !== false)
+})
+ipcMain.handle('astral:intake:detect', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  return intake.detect(payload.id)
+})
+ipcMain.handle('astral:intake:hook', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  return { ok: true, url: intake.hookUrl(payload.id) }
+})
+ipcMain.handle('astral:intake:messages', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), messages: [] }
+  const res = memoryHost.getService()
+  if (!res) return { ok: false, error: '记忆库已关闭', messages: [] }
+  const out = res.inbox({ action: 'messages', ...(payload || {}) })
+  return out.ok ? { ok: true, messages: out.data } : out
+})
+ipcMain.handle('astral:intake:threads', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), threads: [] }
+  const res = memoryHost.getService()
+  if (!res) return { ok: false, error: '记忆库已关闭', threads: [] }
+  const out = res.inbox({ action: 'threads', ...(payload || {}) })
+  return out.ok ? { ok: true, threads: out.data } : out
+})
+ipcMain.handle('astral:intake:stats', async () => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), stats: null }
+  const res = memoryHost.getService()
+  if (!res) return { ok: false, error: '记忆库已关闭', stats: null }
+  const out = res.inbox({ action: 'stats' })
+  return out.ok ? { ok: true, stats: out.data } : out
+})
+ipcMain.handle('astral:intake:clear', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  const res = memoryHost.getService()
+  if (!res) return { ok: false, error: '记忆库已关闭' }
+  return res.inbox({ action: 'clear', ...(payload || {}) })
+})
+ipcMain.handle('astral:intake:send', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  return intake.send(payload.id, payload || {})
+})
+
+/* ---------------------------------------------------------- 安全边界
+   闸门与账本都在记忆库那一层：关掉记忆服务，闸门也不会假装还在工作。
+   approve / deny 只在这里 —— 工具层拿不到这条路，agent 不能自己批准自己。 */
+function securityBox () {
+  const box = memoryHost.security()
+  return box || null
+}
+
+function securityClosed () {
+  return { ok: false, error: '记忆服务已关闭（设置 → 记忆库）' }
+}
+
+ipcMain.handle('astral:security:status', async () => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), stats: null }
+  const box = securityBox()
+  if (!box) return { ...securityClosed(), stats: null }
+  return box.status()
+})
+
+ipcMain.handle('astral:security:set', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  const box = securityBox()
+  if (!box) return securityClosed()
+  const patch = {}
+  if (typeof payload.guard === 'boolean') patch.guard = payload.guard
+  if (typeof payload.ledger === 'boolean') patch.ledger = payload.ledger
+  if (payload.revokeType) {
+    const allowTypes = { ...(box.read().allowTypes || {}) }
+    delete allowTypes[String(payload.revokeType)]
+    patch.allowTypes = allowTypes
+  }
+  return box.write(patch)
+})
+
+ipcMain.handle('astral:security:pending', async () => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), gates: [] }
+  const box = securityBox()
+  if (!box) return { ...securityClosed(), gates: [] }
+  return box.pending()
+})
+
+ipcMain.handle('astral:security:gates', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), gates: [] }
+  const box = securityBox()
+  if (!box) return { ...securityClosed(), gates: [] }
+  return box.gates(payload || {})
+})
+
+ipcMain.handle('astral:security:decide', async (event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  /* 批准必须来自主窗口本身：内嵌页面、外部链接、被注入的 iframe 都不算。 */
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) {
+    return { ok: false, error: '只有主窗口能批准外发' }
+  }
+  const box = securityBox()
+  if (!box) return securityClosed()
+  const gateId = String(payload.gateId || '')
+  if (!gateId) return { ok: false, error: '缺少闸门编号' }
+  if (payload.decision === 'deny') return box.deny({ id: gateId, note: payload.note })
+  const result = box.approve({ id: gateId, scope: payload.scope === 'type' ? 'type' : 'once', note: payload.note })
+  /* 「这类不再问」只对中低风险开放：密钥级内容永远逐次确认。 */
+  if (result.ok && payload.scope === 'type' && Array.isArray(result.gate && result.gate.hits)) {
+    const risky = result.gate.hits.some((hit) => hit.level === 'critical' || hit.level === 'high')
+    if (risky) return { ...result, note: '密钥级内容不支持「这类不再问」，下一次仍会单独确认' }
+    const allowTypes = { ...(box.read().allowTypes || {}) }
+    for (const hit of result.gate.hits) allowTypes[hit.type] = new Date(Date.now() + 8 * 3600 * 1000).toISOString()
+    box.write({ allowTypes })
+  }
+  return result
+})
+
+ipcMain.handle('astral:security:tasks', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), tasks: [] }
+  const box = securityBox()
+  if (!box) return { ...securityClosed(), tasks: [] }
+  return box.tasks(payload || {})
+})
+
+ipcMain.handle('astral:security:task', async (_event, payload = {}) => {
+  const action = String(payload.action || 'open')
+  /* 追原委是只读回查：它会把原话取出来给用户看，但不改任何东西。 */
+  if (action === 'trace') {
+    if (!roleCan('memory.read')) return deny('memory.read')
+    const box = securityBox()
+    if (!box) return securityClosed()
+    return box.trace({ id: payload.id, query: payload.query, days: payload.days })
+  }
+  if (!roleCan('memory.write')) return deny('memory.write')
+  const box = securityBox()
+  if (!box) return securityClosed()
+  if (action === 'drop') return box.dropTask({ id: payload.id })
+  if (action === 'close') return box.closeTask({ id: payload.id, outcome: payload.outcome, evidence: payload.evidence })
+  if (action === 'digest') return box.digestTask({ id: payload.id, force: payload.force })
+  if (action === 'export') return box.exportTask({ id: payload.id })
+  return box.openTask(payload || {})
+})
+
+ipcMain.handle('astral:security:ledger', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return { ...deny('memory.read'), entries: [] }
+  const box = securityBox()
+  if (!box) return { ...securityClosed(), entries: [] }
+  return box.ledger(payload || {})
+})
+
+ipcMain.handle('astral:security:verify', async () => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  const box = securityBox()
+  if (!box) return securityClosed()
+  return box.verify()
+})
+
 ipcMain.handle('astral:mcp:list', async () => {
   try {
     return mcpRegistry.snapshot()
@@ -1176,7 +1639,55 @@ async function confirmToolCall (effective, decision) {
   }
 }
 
+/* 外发确认：和「允许调用工具」长得像，但问的是两件事。
+   工具授权回答「这个工具能不能用」，这里回答「这段内容能不能出去」。
+   后者的默认答案是「不发」——按钮顺序、颜色、取消值都按这个来。 */
+async function confirmOutbound (screening, effective) {
+  if (process.env.ASTRAL_TEST_APPROVAL === '1') {
+    const raw = process.env.ASTRAL_OUTBOUND_CHOICES || process.env.ASTRAL_APPROVAL_CHOICES || ''
+    const choices = raw.split(',').map((item) => Number(item)).filter((item) => item === 0 || item === 1)
+    if (!choices.length) return 1
+    const choice = choices.shift()
+    process.env.ASTRAL_OUTBOUND_CHOICES = choices.join(',')
+    return choice
+  }
+
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : BrowserWindow.getFocusedWindow()
+  const question = screening.question || {}
+  const detail = [
+    `去处：${screening.target || '外部'}`,
+    `成员：${effective.agentName || effective.agentId || '未知'} · 项目：${effective.projectName || effective.projectId || '当前项目'}`,
+    question.detail ? '' : null,
+    question.detail || '',
+    screening.purpose ? `\n为什么发：${screening.purpose}` : null,
+    '',
+    '批准只对「这一份内容 + 这一个去处」有效；改一个字、换一个人，都会重新问。'
+  ].filter((line) => line !== null).join('\n')
+
+  const critical = screening.risk === 'critical'
+  try {
+    const choice = await showThemedConfirm({
+      parent,
+      title: question.title || '这段内容要发出去吗？',
+      message: question.message || '这次调用会把内容送出本机',
+      detail,
+      actions: [
+        { value: 0, label: mainT('允许这一次'), style: critical ? 'ghost' : 'primary' },
+        { value: 1, label: mainT('拒绝'), style: critical ? 'primary' : 'danger' }
+      ],
+      cancelValue: 1,
+      themeTokens: await dialogThemeTokens(),
+      width: 620,
+      height: 560
+    })
+    return typeof choice === 'number' ? choice : 1
+  } catch {
+    return 1
+  }
+}
+
 ipcMain.handle('astral:mcp:call', async (_event, payload = {}) => {
+  if (!roleCan('tools')) return deny('tools')
   const startedAt = Date.now()
   /* 渲染层可能塞 approved / approvalToken 试图绕过；主进程一律忽略。
      真正的授权只来自主进程：正在运行的 run + 权限权威判定 + 原生确认 + 一次性令牌。 */
@@ -1267,6 +1778,47 @@ ipcMain.handle('astral:mcp:call', async (_event, payload = {}) => {
     }
   }
 
+  /* 出站守卫：放在这里，而不是放进上面的「要不要问」里，是故意的。
+     完全授权、自动允许、始终允许都跳不过这一道 ——
+     「允许 AI 用工具」和「允许把一段密钥发出去」本来就是两件事。
+     命中只记脱敏片段与指纹，正文不进库。
+     内置工具不出本机，连库都不必打开。 */
+  const mayLeave = Boolean(effective.serverId) && effective.serverId !== 'builtin'
+  const security = mayLeave ? memoryHost.security() : null
+  let outbound = null
+  if (security) {
+    const screening = security.screenToolCall({
+      serverId: effective.serverId,
+      serverName: effective.serverName,
+      tool: effective.tool,
+      args: effective.args || {},
+      projectId: effective.projectId,
+      runId: effective.runId,
+      purpose: effective.purpose || ''
+    })
+    if (screening && screening.ok === false) {
+      /* 闸门自己坏了（库打不开 / 写到一半失败）：不假装拦住了。
+         记一个标记进审计，让「这次没有过闸门」在日志里看得见；
+         工具本身仍有下面那道原生确认兜着。 */
+      outbound = 'gate-error'
+    } else if (screening && screening.verdict === 'confirm') {
+      const choice = await confirmOutbound({ ...screening, purpose: effective.purpose || '' }, effective)
+      if (choice !== 0) {
+        security.deny({ id: screening.gateId, note: '用户在出站确认里选了拒绝' })
+        const error = `外发被拦下：内容里有 ${(screening.hits || []).map((hit) => hit.label).join('、') || '敏感内容'}，你选择了不发送`
+        toolGateway.record({
+          payload: effective,
+          decision: { ...decision, ok: false, error },
+          durationMs: Date.now() - startedAt,
+          approval: { source: 'outbound-denied', ok: false, id: screening.gateId }
+        })
+        return { ok: false, denied: true, error, gateId: screening.gateId, reason: 'outbound-denied' }
+      }
+      security.approve({ id: screening.gateId, scope: 'once' })
+      outbound = screening.gateId
+    }
+  }
+
   /* 敏感工具由主进程原生对话框确认，渲染层无法伪造确认。 */
   const allGranted = ['readFiles', 'writeFiles', 'runCommands', 'network', 'tools', 'memory']
     .every((key) => Boolean(permissions[key]))
@@ -1326,7 +1878,8 @@ ipcMain.handle('astral:mcp:call', async (_event, payload = {}) => {
     const approvedPayload = {
       ...effective,
       approvalSource: approval.source,
-      approvalId: approval.id
+      approvalId: approval.id,
+      securityGate: outbound || ''
     }
     const result = await mcpRegistry.call({
       ...approvedPayload,
@@ -1391,6 +1944,7 @@ ipcMain.handle('astral:diagnostics:export', async () => {
 })
 
 ipcMain.handle('astral:mcp:setEnabled', async (_event, payload = {}) => {
+  if (!roleCan('settings')) return deny('settings')
   try {
     return await mcpRegistry.setEnabled(payload.serverId, payload.enabled)
   } catch (err) {
@@ -1512,6 +2066,14 @@ ipcMain.on('astral:bridge:reply', (_event, msg) => {
 
 async function bootPayload () {
   const settings = await readJson(path.join(CONFIG_DIR, 'settings.json'), {})
+  /* 口令哈希不离开主进程 */
+  if (settings && settings.profile && settings.profile.rolePin) {
+    settings.profile = { ...settings.profile }
+    settings.profile.hasPin = true
+    delete settings.profile.rolePin
+  } else if (settings && settings.profile) {
+    settings.profile = { ...settings.profile, hasPin: false }
+  }
   const rawProviders = await readJson(path.join(CONFIG_DIR, 'providers.json'), { providers: [] })
   const providers = await secrets.hydrateProviders(rawProviders)
   const roster = await readJson(path.join(CONFIG_DIR, 'roster.json'), { agents: [] })
@@ -1537,10 +2099,15 @@ ipcMain.handle('astral:boot', async () => bootPayload())
 
 ipcMain.handle('astral:saveConfig', async (_event, file, data) => {
   if (!CONFIG_FILES.includes(file)) return { ok: false, message: 'unknown config file' }
+  if (file === 'providers.json' && !roleCan('providers')) return deny('providers')
+  if ((file === 'roster.json' || file === 'team-templates.json') && !roleCan('roster')) return deny('roster')
+  if (file === 'projects.json' && !roleCan('project.manage')) return deny('project.manage')
+  if (file === 'settings.json' && roleSnapshot() === 'guest') return deny('settings')
   try {
     if (file === 'providers.json') {
       return await secrets.saveProviders(data)
     }
+    if (file === 'settings.json') data = sanitizeSettingsForRole(data, roleSnapshot())
     await writeJson(path.join(CONFIG_DIR, file), data)
     return { ok: true }
   } catch (err) {
@@ -1548,10 +2115,55 @@ ipcMain.handle('astral:saveConfig', async (_event, file, data) => {
   }
 })
 
+ipcMain.handle('astral:role:switch', async (_event, payload = {}) => {
+  const target = String(payload.role || '')
+  const refuse = (error) => ({ ok: false, denied: true, error })
+  if (!ROLE_RANK[target]) return refuse('未知身份')
+  const settings = readSettingsFile()
+  const profile = settings.profile || {}
+  const current = ROLE_RANK[profile.role] ? profile.role : 'admin'
+  if (target === current) return { ok: true, role: current }
+
+  /* 降级只能由管理员发起；升级回管理员必须验口令。
+     没有口令时不允许降级，避免把自己锁在外面。 */
+  if (current === 'admin') {
+    if (target !== 'admin' && !profile.rolePin) {
+      return refuse('请先设置管理员口令，否则降级后无法在本机切回')
+    }
+  } else if (target === 'admin') {
+    if (!profile.rolePin) {
+      return refuse('没有管理员口令：请手动修改 settings.json 的 profile.role，或重置本机配置')
+    }
+    if (pinHash(payload.pin) !== profile.rolePin) {
+      return refuse('管理员口令不正确')
+    }
+  } else {
+    return refuse('只有管理员可以切换其他身份')
+  }
+
+  settings.profile = { ...profile, role: target }
+  await writeJson(path.join(CONFIG_DIR, 'settings.json'), settings)
+  return { ok: true, role: target }
+})
+
+ipcMain.handle('astral:role:setPin', async (_event, payload = {}) => {
+  if (!roleCan('role.manage')) return deny('role.manage')
+  const pin = String(payload.pin || '')
+  if (pin && pin.length < 4) return { ok: false, error: '口令至少 4 位' }
+  const settings = readSettingsFile()
+  settings.profile = { ...(settings.profile || {}) }
+  if (pin) settings.profile.rolePin = pinHash(pin)
+  else delete settings.profile.rolePin
+  await writeJson(path.join(CONFIG_DIR, 'settings.json'), settings)
+  return { ok: true, hasPin: Boolean(pin) }
+})
+
 ipcMain.handle('astral:providerKey:set', async (_event, payload = {}) => {
+  if (!roleCan('providers')) return deny('providers')
   return secrets.setKey(payload.id, payload.key)
 })
 ipcMain.handle('astral:providerKey:clear', async (_event, payload = {}) => {
+  if (!roleCan('providers')) return deny('providers')
   return secrets.clearKey(payload.id)
 })
 ipcMain.handle('astral:providerKey:has', async (_event, payload = {}) => {
@@ -1585,6 +2197,7 @@ ipcMain.handle('astral:knowledge:list', async (_event, payload = {}) => {
 })
 
 ipcMain.handle('astral:knowledge:save', async (_event, payload = {}) => {
+  if (!roleCan('knowledge.write')) return deny('knowledge.write')
   try {
     const projectId = payload.projectId
     const file = knowledgeFile(projectId)
@@ -1623,6 +2236,7 @@ ipcMain.handle('astral:knowledge:save', async (_event, payload = {}) => {
 })
 
 ipcMain.handle('astral:knowledge:delete', async (_event, payload = {}) => {
+  if (!roleCan('knowledge.write')) return deny('knowledge.write')
   try {
     const data = await readKnowledge(payload.projectId)
     const id = String(payload.id || '')
@@ -1656,8 +2270,36 @@ ipcMain.handle('astral:knowledge:pick-dir', async () => {
 
 ipcMain.handle('astral:session:load', async () => readJson(SESSION_FILE, { messages: [] }))
 ipcMain.handle('astral:session:save', async (_event, data) => {
+  if (!roleCan('chat')) return deny('chat')
   try {
     await writeJson(SESSION_FILE, data)
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, message: err.message }
+  }
+})
+
+/* 超级智能体的直连会话：和项目会话分开存，切项目不会带走它，
+   也不进项目的历史文件。只在渲染层需要时读写，不参与编排。 */
+const SUPER_SESSION_FILE = () => path.join(CONFIG_DIR, 'super-agent', 'session.json')
+
+ipcMain.handle('astral:superSession:load', async () => {
+  const data = await readJson(SUPER_SESSION_FILE(), { version: 1, messages: [] })
+  return {
+    version: 2,
+    messages: (Array.isArray(data && data.messages) ? data.messages : []).slice(-120),
+    memory: (Array.isArray(data && data.memory) ? data.memory : [])
+      .filter((item) => item && typeof item.text === 'string' && item.text.trim())
+      .slice(-64)
+      .map((item) => ({ ts: Number(item.ts) || 0, text: String(item.text).slice(0, 2000) }))
+  }
+})
+ipcMain.handle('astral:superSession:save', async (_event, data) => {
+  if (!roleCan('chat')) return deny('chat')
+  const messages = Array.isArray(data && data.messages) ? data.messages.slice(-120) : []
+  const memory = Array.isArray(data && data.memory) ? data.memory.slice(-64) : []
+  try {
+    await writeJson(SUPER_SESSION_FILE(), { version: 2, updatedAt: Date.now(), messages, memory })
     return { ok: true }
   } catch (err) {
     return { ok: false, message: err.message }
@@ -1747,6 +2389,7 @@ ipcMain.handle('astral:runOwner:reset', async (_event, payload = {}) => {
 })
 
 ipcMain.handle('astral:runs:start', async (_event, payload = {}) => {
+  if (!roleCan('chat')) return deny('chat')
   try {
     const authority = permissionAuthority.resolve(payload)
     if (!authority.ok) return { ok: false, error: authority.error }
@@ -1785,6 +2428,7 @@ ipcMain.handle('astral:runs:start', async (_event, payload = {}) => {
 })
 
 ipcMain.handle('astral:runs:event', async (_event, payload = {}) => {
+  if (!roleCan('chat')) return deny('chat')
   try {
     const event = runStore.event(payload.id, payload.type, payload.data || {})
     return event ? { ok: true } : { ok: false, error: '没有这条运行记录' }
@@ -1794,12 +2438,14 @@ ipcMain.handle('astral:runs:event', async (_event, payload = {}) => {
 })
 
 ipcMain.handle('astral:runs:finish', async (_event, payload = {}) => {
+  if (!roleCan('chat')) return deny('chat')
   runCapabilities.delete(String(payload.id || ''))
   const run = runStore.finish(payload.id, payload.status, { error: payload.error || '' })
   return run ? { ok: true, run } : { ok: false, error: '没有这条运行记录' }
 })
 
 ipcMain.handle('astral:runs:abandon', async (_event, payload = {}) => {
+  if (!roleCan('chat')) return deny('chat')
   runCapabilities.delete(String(payload.id || ''))
   const run = runStore.abandon(payload.id)
   return run ? { ok: true, run } : { ok: false, error: '没有这条运行记录' }
@@ -1813,9 +2459,18 @@ ipcMain.handle('astral:jobs:get', async (_event, payload = {}) => {
   const job = jobStore.get(payload.id)
   return job ? { ok: true, job } : { ok: false, error: '找不到长任务' }
 })
-ipcMain.handle('astral:jobs:create', async (_event, payload = {}) => jobStore.create(payload))
-ipcMain.handle('astral:jobs:update', async (_event, payload = {}) => jobStore.update(payload.id, payload))
-ipcMain.handle('astral:jobs:remove', async (_event, payload = {}) => jobStore.remove(payload.id))
+ipcMain.handle('astral:jobs:create', async (_event, payload = {}) => {
+  if (!roleCan('job.manage')) return deny('job.manage')
+  return jobStore.create(payload)
+})
+ipcMain.handle('astral:jobs:update', async (_event, payload = {}) => {
+  if (!roleCan('job.manage')) return deny('job.manage')
+  return jobStore.update(payload.id, payload)
+})
+ipcMain.handle('astral:jobs:remove', async (_event, payload = {}) => {
+  if (!roleCan('job.manage')) return deny('job.manage')
+  return jobStore.remove(payload.id)
+})
 
 function safeProjectSessionFile (projectId) {
   const id = String(projectId || '')
@@ -1830,6 +2485,7 @@ ipcMain.handle('astral:projectSession:load', async (_event, projectId) => {
 })
 
 ipcMain.handle('astral:projectSession:save', async (_event, projectId, data) => {
+  if (!roleCan('chat')) return { ok: false, denied: true, message: '权限拒绝：游客不能写入会话' }
   const file = safeProjectSessionFile(projectId)
   if (!file) return { ok: false, message: 'invalid project id' }
   try {
@@ -1903,6 +2559,7 @@ ipcMain.handle('astral:readProjectFile', async (_event, payload = {}) => {
 })
 
 ipcMain.handle('astral:writeProjectFile', async (_event, payload = {}) => {
+  if (!roleCan('files.write')) return deny('files.write')
   const checked = await scopedFile(payload.rootPath, payload.filePath)
   if (!checked.ok) return checked
   const text = String(payload.text ?? '')
@@ -2175,6 +2832,7 @@ ipcMain.handle('astral:pickDataFile', async () => {
 })
 
 ipcMain.handle('astral:saveDataFile', async (_event, payload = {}) => {
+  if (!roleCan('files.write')) return deny('files.write')
   const name = String(payload.name || '').trim()
   if (!name) return { ok: false, error: '缺少文件名' }
   const ext = (String(payload.ext || path.extname(name)).toLowerCase().replace(/^\./, '')) || 'txt'
@@ -2210,6 +2868,7 @@ ipcMain.handle('astral:saveDataFile', async (_event, payload = {}) => {
 })
 
 ipcMain.handle('astral:deleteDataFile', async (_event, payload = {}) => {
+  if (!roleCan('files.write')) return deny('files.write')
   const rel = String(payload.path || '')
   if (!rel.startsWith('data' + path.sep) && !rel.startsWith('data/')) {
     return { ok: false, error: '路径不在数据目录内' }
@@ -2665,6 +3324,50 @@ function fitToScreen (saved) {
   return { width, height }
 }
 
+let memoryWindow = null
+
+/* 记忆库控制台：独立窗口，复用同一次启动的 view-server；关掉窗口不杀服务。
+   payload.view 可直达 #hard / #starmap，供主界面「上下文」面板跳转。 */
+async function openMemoryConsole (payload = {}) {
+  const write = roleCan('memory.write')
+  const started = await memoryHost.startConsole({ write })
+  if (!started.ok) return started
+  const view = ['hard', 'starmap'].includes(payload && payload.view) ? payload.view : ''
+  const target = started.url + (view ? '#' + view : '')
+  if (memoryWindow && !memoryWindow.isDestroyed()) {
+    memoryWindow.loadURL(target)
+    memoryWindow.show()
+    memoryWindow.focus()
+    return { ok: true, url: target, reused: started.reused }
+  }
+  const pngIcon = nativeImage.createFromPath(path.join(APP_DIR, 'assets', 'astral-icon.png'))
+  const icoIcon = nativeImage.createFromPath(path.join(APP_DIR, 'assets', 'astral-icon.ico'))
+  const windowIcon = pngIcon.isEmpty() ? icoIcon : pngIcon
+  memoryWindow = new BrowserWindow({
+    width: 1320,
+    height: 880,
+    minWidth: 980,
+    minHeight: 640,
+    center: true,
+    show: false,
+    title: '星界 · 记忆库',
+    backgroundColor: '#05060d',
+    autoHideMenuBar: true,
+    icon: windowIcon.isEmpty() ? undefined : windowIcon,
+    parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      spellcheck: false
+    }
+  })
+  memoryWindow.once('ready-to-show', () => { if (memoryWindow) memoryWindow.show() })
+  memoryWindow.on('closed', () => { memoryWindow = null })
+  await memoryWindow.loadURL(target)
+  return { ok: true, url: target, reused: started.reused }
+}
+
 function createWindow (savedState) {
   lastWindowState = savedState || lastWindowState
   const { width, height } = fitToScreen(savedState)
@@ -2899,6 +3602,7 @@ app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return
   registerAppProtocol()
   await ensureConfig()
+  flushMessageFallback().catch((err) => console.error('[message fallback]', err.message))
   const settings = await readJson(path.join(CONFIG_DIR, 'settings.json'), {})
   await loadMainLocale(settings.language || 'zh-CN')
   const backgroundCfg = await readJson(BACKGROUND_FILE(), {})
@@ -2912,6 +3616,16 @@ app.whenReady().then(async () => {
   }
   const savedWindow = await readJson(WINDOW_STATE_FILE(), null)
   createWindow(savedWindow)
+  if (memoryHost.enabled()) {
+    try { memoryHost.ensureService() } catch (err) { console.error('记忆库打开失败：' + err.message) }
+    /* 接入层跟着记忆库一起起：没有库就没有收件箱，收了也存不住 */
+    intake.startServer()
+      .then((info) => {
+        if (!info || !info.ok) return
+        return intake.startAll()
+      })
+      .catch((err) => console.error('消息接入启动失败：' + err.message))
+  }
   createTray()
   if (bridgeCfg.enabled !== false && mainWindow) {
     await startBridge(mainWindow, bridgeCfg.port || 45871, bridgeToken)
@@ -2933,6 +3647,8 @@ app.on('before-quit', () => {
   isQuitting = true
   destroyTray()
   mcpRegistry.shutdown().catch(() => {})
+  intake.shutdown().catch(() => {})
+  memoryHost.stop()
   if (bridgeServer) bridgeServer.close()
   killSpeechProcess()
 })

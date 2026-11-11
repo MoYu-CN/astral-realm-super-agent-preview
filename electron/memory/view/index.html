@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星界 · 记忆库控制台</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<svg class="sprite" aria-hidden="true">
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M9 9v11M15 9v11"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="M3 13l9 5 9-5M3 17.5l9 5 9-5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.4 8.2 8 9 4.6-.8 8-4 8-9V6l-8-3Z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 4h7a3 3 0 0 1 3 3v13a2.5 2.5 0 0 0-2.5-2.5H4V4Z"/><path d="M20 4h-3a3 3 0 0 0-3 3v13a2.5 2.5 0 0 1 2.5-2.5H20V4Z"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></symbol>
+  <symbol id="i-stars" viewBox="0 0 24 24"><path d="m12 3 1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3Z"/><path d="m18.5 15 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z"/><path d="M5 16h.01M8 19h.01"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18a4.5 4.5 0 0 1-.5-9A6 6 0 0 1 18 10a4 4 0 0 1 0 8H7Z"/><path d="M12 12v5m0 0-2-2m2 2 2-2"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.8-6.5 10-6.5S22 12 22 12s-3.8 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6V3Z"/><path d="M14 3v5h4M9 13h6M9 17h4"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"/><path d="m19 16 .7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7.7-2Z"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><rect x="2.5" y="4" width="7" height="6" rx="1.5"/><rect x="14.5" y="4" width="7" height="6" rx="1.5"/><rect x="8.5" y="15" width="7" height="6" rx="1.5"/><path d="M6 10v3h12v-3M12 13v2"/></symbol>
+  <symbol id="i-orbit" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><ellipse cx="12" cy="12" rx="10" ry="4.6" transform="rotate(-28 12 12)"/><circle cx="19.4" cy="6.6" r="1.4"/><circle cx="4.6" cy="17.4" r="1.1"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L20 8l-4-4L4 16v4Z"/><path d="m14 6 4 4"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5V4Z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M4 9h10a6 6 0 0 1 0 12h-3"/><path d="m8 5-4 4 4 4"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 7.6v.1"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></symbol>
+</svg>
+
+<!-- 星界同款深空三层背景 -->
+<canvas id="fx-stars" class="fx-stars" aria-hidden="true"></canvas>
+<div class="fx-aurora" aria-hidden="true"><span></span><span></span><span></span></div>
+<div class="fx-grain" aria-hidden="true"></div>
+
+<div class="shell">
+  <!-- 左：rail（与主界同款） -->
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 36 36" width="36" height="36" fill="none">
+          <defs>
+            <radialGradient id="mHalo" cx="18" cy="18" r="18" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#F1E4FF" stop-opacity=".45"/><stop offset=".3" stop-color="#D2BAFF" stop-opacity=".24"/><stop offset=".66" stop-color="#AC8AEA" stop-opacity=".07"/><stop offset="1" stop-color="#8F6BD4" stop-opacity="0"/></radialGradient>
+            <radialGradient id="mBody" cx="18" cy="17.1" r="15.2" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FBF4FF"/><stop offset=".22" stop-color="#E5CEFF"/><stop offset=".62" stop-color="#BE99F4"/><stop offset="1" stop-color="#8C67CA"/></radialGradient>
+            <radialGradient id="mCore" cx="17.6" cy="16.8" r="3.8" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#F8EDFF"/><stop offset=".6" stop-color="#DCC2FF"/><stop offset="1" stop-color="#C6A6F2"/></radialGradient>
+          </defs>
+          <circle cx="18" cy="18" r="18" fill="url(#mHalo)"/>
+          <path d="M18 3.8 C18.5 12.4 19.4 15.9 32.4 18 C19.4 20.1 18.5 23.6 18 32.2 C17.5 23.6 16.6 20.1 3.6 18 C16.6 15.9 17.5 12.4 18 3.8 Z" fill="url(#mBody)"/>
+          <path d="M18 4.6 C18.4 12.6 19.3 16 31.6 18 C19.3 20 18.4 23.4 18 31.4 C17.6 23.4 16.7 20 4.4 18 C16.7 16 17.6 12.6 18 4.6 Z" fill="none" stroke="#EEE4FF" stroke-opacity=".35" stroke-width=".6"/>
+          <circle cx="17.8" cy="17.2" r="3.8" fill="url(#mCore)"/>
+          <circle cx="16.4" cy="15.8" r=".95" fill="#FFFFFF" opacity=".85"/>
+        </svg>
+      </div>
+      <div class="brand-text"><strong>星界</strong><span>ASTRAL REALM</span></div>
+    </div>
+    <div class="rail-sub">记忆库控制台 <em>MEMORY CONSOLE</em></div>
+
+    <nav class="nav" id="nav">
+      <div class="nav-label">工作区</div>
+      <button class="nav-item active" data-view="overview"><svg><use href="#i-grid"/></svg><span>总览</span></button>
+      <button class="nav-item" data-view="starmap"><svg><use href="#i-orbit"/></svg><span>星图</span><span class="cnt" id="map-count">—</span></button>
+      <button class="nav-item" data-view="time"><svg><use href="#i-clock"/></svg><span>时间</span><span class="cnt" id="time-count">—</span></button>
+      <button class="nav-item" data-view="kb"><svg><use href="#i-layers"/></svg><span>知识网</span><span class="cnt" id="kb-count">—</span></button>
+      <button class="nav-item" data-view="hard"><svg><use href="#i-shield"/></svg><span>硬性上下文</span><span class="cnt" id="hard-count">4</span></button>
+      <div class="nav-label">数据表 <span class="nav-count" id="nav-count">9</span></div>
+      <div id="nav-tables"></div>
+    </nav>
+
+    <div class="rail-foot">
+      <button class="ghost-btn" data-view="compare"><svg><use href="#i-flow"/></svg> 工作流对比</button>
+      <button class="ghost-btn" data-view="about"><svg><use href="#i-shield"/></svg> 服务与安全</button>
+      <span class="readonly-pill"><svg><use href="#i-shield"/></svg> 记录只读 · 上下文可编辑</span>
+    </div>
+  </aside>
+
+  <div class="resizer" aria-hidden="true"></div>
+
+  <!-- 中：stage -->
+  <main class="stage">
+    <header class="topbar">
+      <div class="channel">
+        <div class="channel-head"><h1 id="channel-name">记忆库总览</h1><span class="channel-tag" id="channel-tag">实时</span></div>
+        <p id="channel-sub">本地结构化记忆的实时快照 · 全部数据只读</p>
+      </div>
+      <div class="topbar-actions">
+        <label class="chip search-chip"><svg><use href="#i-search"/></svg><input id="global-q" type="search" placeholder="全局搜索…" autocomplete="off"></label>
+        <button class="chip" id="stars-toggle" title="星野开关">星野</button>
+        <button class="chip" id="refresh" title="刷新">刷新</button>
+        <span class="bridge on" id="bridge" title="记忆服务连接状态"><i class="node"></i><i class="beam"></i><i class="node"></i><span class="bridge-label">MCP</span></span>
+      </div>
+    </header>
+
+    <div class="stream">
+      <!-- 总览 -->
+      <section class="view" id="view-overview">
+        <div class="page-head">
+          <div><h1>记忆库总览</h1><p>按项目、事件与索引组织的活跃记忆，所有记录均可点开预览完整内容。</p></div>
+          <div class="updated"><svg><use href="#i-clock"/></svg><span id="updated-at">—</span></div>
+        </div>
+        <div class="kpis" id="kpis"></div>
+        <div class="charts">
+          <div class="panel chart-panel"><div class="panel-head"><h2>事件趋势</h2><span class="panel-sub">近 14 天</span></div><div id="trend" class="chart-body"><div class="skeleton skeleton-chart"></div></div></div>
+          <div class="panel chart-panel"><div class="panel-head"><h2>数据构成</h2><span class="panel-sub">按表</span></div><div id="share" class="chart-body"><div class="skeleton skeleton-chart"></div></div></div>
+        </div>
+        <div class="charts">
+          <div class="panel"><div class="panel-head"><h2>事件编号分布</h2><span class="panel-sub">按前缀</span></div><div id="prefix-bars" class="bars"></div></div>
+          <div class="panel"><div class="panel-head"><h2>最近事件</h2><span class="panel-sub">点击预览记录</span></div><div id="recent" class="timeline"></div></div>
+        </div>
+      </section>
+
+      <!-- 星图 -->
+      <section class="view hidden" id="view-starmap">
+        <div class="page-head">
+          <div><h1>星图</h1><p>把记忆文件与真实记录画成一张星图：谁连着谁、哪里刻意不相连，一眼看清。</p></div>
+          <div class="seg map-modes" id="map-modes">
+            <button data-mode="concept" class="on">文件关系</button>
+            <button data-mode="data">数据星图</button>
+          </div>
+        </div>
+        <div class="panel map-panel">
+          <div class="map-toolbar">
+            <div class="map-legend" id="map-legend"></div>
+            <span class="spacer"></span>
+            <div class="map-focus hidden" id="map-focus"><i></i>聚焦 <b id="map-focus-name">—</b></div>
+            <button class="chip" id="map-back-main" hidden title="退出单星位图，回到整张星图">返回主星图</button>
+            <div class="map-zoom">
+              <button class="chip icon-chip" id="map-zoom-out" title="拉远"><svg><use href="#i-minus"/></svg></button>
+              <button class="chip map-home" id="map-zoom-reset" title="回到总览，看整张星图"><svg><use href="#i-target"/></svg><span>总览</span></button>
+              <button class="chip icon-chip" id="map-zoom-in" title="推近"><svg><use href="#i-plus"/></svg></button>
+            </div>
+          </div>
+          <div class="map-stage" id="map-stage">
+            <canvas id="starmap" role="img" aria-label="记忆星图"></canvas>
+            <div class="map-tip hidden" id="map-tip"></div>
+            <div class="map-loading" id="map-loading"><div class="skeleton skeleton-chart"></div></div>
+          </div>
+          <div class="map-foot"><span id="map-summary">—</span><span class="map-hint">拖拽旋转 · 滚轮推拉 · 点击星体飞到它的位置 · 聚焦后连线上显示相关度</span></div>
+        </div>
+      </section>
+
+      <!-- 时间 -->
+      <section class="view hidden" id="view-time">
+        <div class="page-head">
+          <div><h1>时间</h1><p>按周记下这一周做了什么；按「周几 + 小时」编出习惯网。它与项目、事件分开，不参与回忆打分。</p></div>
+          <div class="seg" id="time-modes">
+            <button data-mode="habit" class="on">时段习惯</button>
+            <button data-mode="week">时间文档</button>
+          </div>
+        </div>
+
+        <div class="time-suggest" id="time-suggest">
+          <span class="time-suggest-mark" aria-hidden="true">✦</span>
+          <div class="time-suggest-main">
+            <strong id="time-suggest-title">这个时段还没有足够记录</strong>
+            <span id="time-suggest-sub">等积累几次事件后，这里会告诉你「这个点通常在做什么」。</span>
+          </div>
+          <span class="time-suggest-pct" id="time-suggest-pct">—</span>
+        </div>
+
+        <div class="panel phase-panel">
+          <div class="panel-head"><h2>进程阶段</h2><span class="panel-sub">阶段由用户自己的事件进程决定 · 概率随近期变化漂移</span></div>
+          <div class="phase-layout">
+            <div class="phase-current">
+              <div class="phase-ask" id="phase-ask">还没有足够的进程轨迹。</div>
+              <div class="phase-intents" id="phase-intents"></div>
+              <div class="phase-transition" id="phase-transition"></div>
+            </div>
+            <div class="phase-table" id="phase-table"></div>
+          </div>
+        </div>
+
+        <div class="time-layout">
+          <div class="panel time-heat">
+            <div class="panel-head"><h2>一周时段</h2><span class="panel-sub">颜色越亮，这个时段越固定 · 点击查看</span></div>
+            <div class="heat-grid" id="time-grid"></div>
+            <div class="time-pick" id="time-pick">点一个格子，看这个时段在做什么。</div>
+          </div>
+          <div class="panel time-weeks">
+            <div class="panel-head"><h2>时间文档</h2><span class="panel-sub" id="week-sub">按周自动生成</span></div>
+            <div class="week-list" id="week-list"></div>
+            <pre class="week-body" id="week-body">选择一周查看周记。</pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- 知识网：第四张网 -->
+      <section class="view hidden" id="view-kb">
+        <div class="page-head">
+          <div><h1>知识网</h1><p>知识条目也有权重：用得多升、光搜不用降、放久了降。检索只回摘要，正文按需单条取，库再大也不涨上下文。</p></div>
+          <div class="updated"><svg><use href="#i-clock"/></svg><span id="kb-updated">—</span></div>
+        </div>
+        <div class="kpis" id="kb-kpis"></div>
+        <div class="kb-layout">
+          <div class="panel">
+            <div class="panel-head"><h2>权重最高</h2><span class="panel-sub">按自身权重排，不是按最近使用</span></div>
+            <div class="kb-list" id="kb-top"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>冷条目</h2><span class="panel-sub">从没打开过 · 已放置半个月以上</span></div>
+            <div class="kb-list" id="kb-cold"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>最近检索</h2><span class="panel-sub">每次给了几条、花了多少字</span></div>
+          <div class="kb-hits" id="kb-hits"></div>
+        </div>
+      </section>
+
+      <!-- 硬性上下文 -->
+      <section class="view hidden" id="view-hard">
+        <div class="page-head">
+          <div><h1>硬性上下文</h1><p>每一轮都会进入超级智能体的系统提示词。四块合计上限 3600 字，改完保存即生效。</p></div>
+          <div class="seg" id="hard-mode">
+            <button data-mode="edit" class="on">编辑</button>
+            <button data-mode="view">查看</button>
+          </div>
+        </div>
+        <div class="hard-grid">
+          <div class="hard-list" id="hard-list"></div>
+          <div class="panel hard-editor">
+            <div class="hard-editor-head">
+              <div>
+                <span class="eyebrow">常驻块</span>
+                <h2 id="hard-title">身份与边界</h2>
+                <p id="hard-hint">—</p>
+              </div>
+              <span class="hard-rev" id="hard-rev">v1</span>
+            </div>
+            <textarea id="hard-text" class="hard-text" spellcheck="false" placeholder="在这里写这一块的内容…"></textarea>
+            <div id="hard-preview" class="hard-preview doc hidden"></div>
+            <div class="hard-editor-foot">
+              <div class="hard-meter">
+                <span id="hard-chars">0 / 0</span>
+                <span class="hard-bar"><i id="hard-bar"></i></span>
+                <span class="hard-dirty" id="hard-dirty"></span>
+              </div>
+              <div class="hard-actions">
+                <button class="chip" id="hard-reset"><svg><use href="#i-undo"/></svg> 还原</button>
+                <button class="chip primary" id="hard-save"><svg><use href="#i-save"/></svg> 保存</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="panel hard-budget-panel">
+          <div class="panel-head"><h2>常驻预算</h2><span class="panel-sub">四块合计 3600 字 · 只保留当前版本</span></div>
+          <div class="hard-budget-bar" id="hard-budget-bar"></div>
+          <div class="hard-budget-legend" id="hard-budget-legend"></div>
+          <div class="hard-flow" id="hard-flow"></div>
+        </div>
+      </section>
+
+      <!-- 数据表 -->
+      <section class="view hidden" id="view-table">
+        <div class="page-head">
+          <div><h1 id="table-title">数据表</h1><p id="table-desc">—</p></div>
+          <div class="updated"><svg><use href="#i-database"/></svg><span id="table-total">—</span></div>
+        </div>
+        <div class="panel table-panel">
+          <div class="table-toolbar">
+            <label class="local-search"><svg><use href="#i-search"/></svg><input id="local-q" type="search" placeholder="在当前表中搜索…" autocomplete="off"></label>
+            <span class="hint" id="row-hint">—</span>
+            <span class="spacer"></span>
+            <button class="chip" id="prev">上一页</button>
+            <span class="page-num" id="page-num">1</span>
+            <button class="chip" id="next">下一页</button>
+          </div>
+          <div class="grid-wrap" id="grid"><div class="skeleton skeleton-table"></div></div>
+        </div>
+      </section>
+
+      <!-- 工作流对比 -->
+      <section class="view hidden" id="view-compare">
+        <div class="page-head"><div><h1>工作流对比</h1><p>为什么把记忆从文本文件搬进数据库，以及还能再省掉哪几步。</p></div></div>
+        <div class="compare-hero" id="compare-hero"></div>
+        <div class="compare-grid" id="compare-grid"></div>
+        <div class="panel"><div class="panel-head"><h2>一次调用能拿到什么</h2><span class="panel-sub">GET /api/record</span></div><div class="bundle-note" id="bundle-note"></div></div>
+      </section>
+
+      <!-- 服务与安全 -->
+      <section class="view hidden" id="view-about">
+        <div class="page-head"><div><h1>服务与安全</h1><p>连接信息、只读边界与云端部署说明。</p></div></div>
+        <div class="about-grid" id="about-grid"></div>
+        <div class="panel about-panel"><div class="panel-head"><h2>接口清单</h2><span class="panel-sub">全部只读</span></div><div class="api-list" id="api-list"></div></div>
+      </section>
+    </div>
+  </main>
+
+  <div class="resizer" aria-hidden="true"></div>
+
+  <!-- 右：dock（星界同款三 tab，用于预览记录） -->
+  <aside class="dock" id="dock">
+    <div class="dock-head">
+      <div><span class="eyebrow" id="dock-eyebrow">记录预览</span><h2 id="dock-title">选择一条记录</h2></div>
+      <div class="dock-head-actions">
+        <button class="chip" id="dock-nodeview" hidden title="只看这个节点的权重位图：权重近的、权重远的">权重位图</button>
+        <button class="chip icon-chip" id="dock-close" title="关闭"><svg><use href="#i-close"/></svg></button>
+      </div>
+    </div>
+    <div class="dock-tabs" id="dock-tabs">
+      <button data-pane="fields" class="active">字段</button>
+      <button data-pane="content">原文</button>
+      <button data-pane="bundle">上下文包</button>
+    </div>
+    <div class="dock-body" id="dock-body">
+      <div class="dock-empty"><svg><use href="#i-eye"/></svg><p>点击表格中的任意一行<br>即可预览这条记录的完整内容</p></div>
+    </div>
+    <div class="dock-foot">
+      <button class="chip" id="copy-record"><svg><use href="#i-copy"/></svg> 复制记录</button>
+      <button class="chip" id="copy-bundle"><svg><use href="#i-spark"/></svg> 复制上下文包</button>
+    </div>
+  </aside>
+</div>
+
+<div class="modal-wrap hidden" id="token-modal">
+  <div class="modal">
+    <span class="modal-icon"><svg><use href="#i-shield"/></svg></span>
+    <h2>需要访问令牌</h2>
+    <p>该服务启用了 API 鉴权，请输入部署时设置的 <code>MEMORY_VIEW_TOKEN</code>。</p>
+    <input id="token-input" type="password" placeholder="访问令牌" autocomplete="off">
+    <div class="modal-actions"><button class="chip primary" id="token-save">连接</button></div>
+    <span class="modal-err" id="token-err"></span>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="search-pop hidden" id="search-pop"></div>
+
+<script src="/starmap3d.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

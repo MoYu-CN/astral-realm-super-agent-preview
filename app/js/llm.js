@@ -484,16 +484,53 @@ export const SOLO_DEFAULT_PROMPT = [
   '- 不确定就说不确定，不编造事实、引用或执行结果。'
 ].join('\n')
 
-export function buildSystemPrompt (agent, opts = {}) {
+/* 上下文分层：每一层都可以在「面板 → 上下文」里单独关掉。
+   core / permissions / tools / output 是固定层，不提供开关：
+   它们要么是诚实性与安全底座，要么必须和真实授权保持一致——
+   在提示词里「关掉」权限说明，并不会收回实际能力，只会让模型误判。 */
+export const CONTEXT_LAYERS = [
+  { key: 'persona', label: '角色设定', hint: '成员的角色提示词或单独对话提示词' },
+  { key: 'identity', label: '身份与职位', hint: '名字、职位、汇报线与团队全貌' },
+  { key: 'project', label: '当前项目', hint: '项目名与文件范围' },
+  { key: 'profile', label: '用户画像', hint: '称呼、简称与长期偏好' },
+  { key: 'hard', label: '硬性上下文', hint: '记忆库常驻四块，只用于超级智能体窗口' },
+  { key: 'bio', label: '简介与说话风格', hint: '成员简介、性格与口吻' },
+  { key: 'skills', label: '技能规范', hint: '通用技能与成员专属技能' },
+  { key: 'notes', label: '项目 / 专属上下文', hint: '项目共享前提与该成员的专属笔记' },
+  { key: 'protocol', label: '协作协议', hint: '汇报、交付与边界规则' },
+  { key: 'data', label: '数据文件清单', hint: '本轮可用的数据文件与字段' },
+  { key: 'thinking', label: '思考强度', hint: '本轮思考档位与展开程度' }
+]
+
+export const FIXED_CONTEXT_LAYERS = [
+  { key: 'core', label: '系统底座', hint: '诚实、依据与格式规范；不可关闭' },
+  { key: 'permissions', label: '权限与工具', hint: '必须与真实授权一致；请在「设置 → 权限与数据」调整' },
+  { key: 'output', label: '输出要求', hint: '语言与文风底线；不可关闭' }
+]
+
+export function contextLayerOn (key) {
+  if (FIXED_CONTEXT_LAYERS.some((layer) => layer.key === key)) return true
+  const box = (state.settings && state.settings.context && state.settings.context.layers) || {}
+  return box[key] !== false
+}
+
+/* 分层装配。返回完整段落，由 buildSystemPrompt 按策略过滤；
+   控制台与上下文面板也读同一份，避免「界面显示一套、实际注入另一套」。 */
+export function promptSections (agent, opts = {}) {
   const channel = opts.channel === 'agent' ? 'agent' : 'user'
   const role = agent.role || 'executor'
   const boss = agent.reportsTo ? (state.roster.agents.find((a) => a.id === agent.reportsTo) || null) : null
   const hasCommander = state.roster.agents.some((a) => a.role === 'commander' && a.enabled !== false)
   const project = activeProject()
   const teamMode = conversationIsTeam()
-  const parts = []
+  const sections = []
 
-  parts.push(CORE_PROMPT)
+  const push = (key, label, text, fixed = false) => {
+    if (!text) return
+    sections.push({ key, label, text, fixed })
+  }
+
+  push('core', '系统底座', CORE_PROMPT, true)
 
   /* 两套提示词严格分开，互不回退：
      团队会话读角色提示词（agent.prompt），单独会话读单独对话提示词（agent.soloPrompt）。
@@ -501,8 +538,10 @@ export function buildSystemPrompt (agent, opts = {}) {
   const persona = teamMode
     ? (agent.prompt || '你是一个可靠的协作助手。')
     : (agent.soloPrompt || SOLO_DEFAULT_PROMPT)
-  parts.push(resolvePromptVars(persona, agent))
-  if (state.conversationMode === 'plugin') parts.push(PLUGIN_MODE_PROMPT)
+  push('persona', '角色设定', [
+    resolvePromptVars(persona, agent),
+    state.conversationMode === 'plugin' ? PLUGIN_MODE_PROMPT : ''
+  ].filter(Boolean).join('\n\n'))
 
   if (teamMode) {
     const roleLine = boss
@@ -512,17 +551,18 @@ export function buildSystemPrompt (agent, opts = {}) {
         : hasCommander
           ? '你在本项目中直接向用户负责。'
           : '你在本项目中独立向用户负责。'
-    parts.push(`## 身份\n你是「${agent.name}」，${agent.title || ROLE_LABEL[role]}。${roleLine}`)
-
-    /* 职位定义与团队全貌：所有成员共享同一份组织信息，
-       确保彼此知道对方是谁、负责什么、向谁汇报。 */
-    parts.push(positionBlock(agent))
     const team = teamBlock(agent)
-    if (team) parts.push(team)
+    push('identity', '身份与职位', [
+      `## 身份\n你是「${agent.name}」，${agent.title || ROLE_LABEL[role]}。${roleLine}`,
+      /* 职位定义与团队全貌：所有成员共享同一份组织信息，
+         确保彼此知道对方是谁、负责什么、向谁汇报。 */
+      positionBlock(agent),
+      team
+    ].filter(Boolean).join('\n\n'))
   } else {
     /* 单独会话没有编制：不写职位、汇报线、下属与成员名单。
        这里也不引用角色提示词——那份只在团队会话里生效。 */
-    parts.push([
+    push('identity', '身份与职位', [
       '## 身份',
       `你是「${agent.name}」，用户直接对话的 AI 助手。`,
       '这条会话里没有编制、职位、上级或下属：不要用「总指挥 / 副指挥 / 执行者」自称，也不要假装把任务交给了谁。'
@@ -530,7 +570,7 @@ export function buildSystemPrompt (agent, opts = {}) {
   }
 
   if (project) {
-    parts.push([
+    push('project', '当前项目', [
       '## 当前项目',
       `项目：${project.name}`,
       project.rootPath
@@ -552,52 +592,61 @@ export function buildSystemPrompt (agent, opts = {}) {
         lines.push(`- 偏好与背景：${profile.likes.trim()}`)
       }
       lines.push('照顾这些偏好，不要复述、不要点出「根据你的偏好」。')
-      parts.push(lines.join('\n'))
+      push('profile', '用户画像', lines.join('\n'))
     }
   } else {
-    parts.push('## 会话边界\n你在「AI ↔ AI」协作区，只处理上级派单。你看不到用户与 AI 的对话、历史与附件，不要假设或编造；缺什么直接在结果里写明。')
+    push('boundary', '会话边界', '## 会话边界\n你在「AI ↔ AI」协作区，只处理上级派单。你看不到用户与 AI 的对话、历史与附件，不要假设或编造；缺什么直接在结果里写明。', true)
   }
 
-  if (agent.bio && agent.bio.trim()) {
-    parts.push(`## 你的简介\n${agent.bio.trim()}`)
+  /* 硬性上下文只进超级智能体窗口：它里面写的是「你是超级智能体」，
+     塞给编制里的指挥或执行者会直接造成身份冲突。 */
+  if (opts.hard === true) {
+    const hard = opts.hardContext || (state.hardContext && state.hardContext.text) || ''
+    if (hard.trim()) push('hard', '硬性上下文', hard.trim())
   }
 
-  if ((agent.traits && agent.traits.length) || (agent.traitNote && agent.traitNote.trim())) {    const bits = []
+  const bio = []
+  if (agent.bio && agent.bio.trim()) bio.push(`## 你的简介\n${agent.bio.trim()}`)
+  if ((agent.traits && agent.traits.length) || (agent.traitNote && agent.traitNote.trim())) {
+    const bits = []
     if (agent.traits && agent.traits.length) bits.push(`性格：${agent.traits.join('、')}。`)
     if (agent.traitNote && agent.traitNote.trim()) bits.push(agent.traitNote.trim())
     bits.push('这些只影响说话方式，不要念出来。')
-    parts.push(`## 说话风格\n${bits.join('\n')}`)
+    bio.push(`## 说话风格\n${bits.join('\n')}`)
   }
+  push('bio', '简介与说话风格', bio.join('\n\n'))
 
   const globalSkills = skillBlock(state.roster.globalSkills)
-  if (globalSkills) parts.push(`## 通用技能规范（全体适用）\n${globalSkills}`)
-
   const own = skillBlock(agent.skills)
-  if (own) parts.push(`## 你的专属技能\n${own}`)
-
-  if (state.roster.globalNotes && state.roster.globalNotes.trim()) {
-    parts.push(`## 项目上下文\n${state.roster.globalNotes.trim()}`)
-  }
+  push('skills', '技能规范', [
+    globalSkills ? `## 通用技能规范（全体适用）\n${globalSkills}` : '',
+    own ? `## 你的专属技能\n${own}` : ''
+  ].filter(Boolean).join('\n\n'))
 
   const notes = agent.context && agent.context.notes
-  if (notes && notes.trim()) parts.push(`## 你的专属上下文\n${notes.trim()}`)
+  push('notes', '项目 / 专属上下文', [
+    state.roster.globalNotes && state.roster.globalNotes.trim()
+      ? `## 项目上下文\n${state.roster.globalNotes.trim()}`
+      : '',
+    notes && notes.trim() ? `## 你的专属上下文\n${notes.trim()}` : ''
+  ].filter(Boolean).join('\n\n'))
 
-  parts.push(`## 协作协议\n${teamMode ? roleProtocol(agent) : SOLO_ROLE_PROTOCOL}`)
+  push('protocol', '协作协议', `## 协作协议\n${teamMode ? roleProtocol(agent) : SOLO_ROLE_PROTOCOL}`)
 
   /* 权限按「全局 ∩ 成员（或默认）」生效，完全授权时全部放行 */
   const perms = effectivePerms(agent)
   const granted = grantedLabels(perms)
-  parts.push([
+  push('permissions', '权限与工具', [
     '## 可用能力',
     granted.length
       ? `用户已授予：${granted.join('、')}。`
       : '用户未授予任何外部能力：你不能读写文件、执行命令或联网。不要声称自己做过这些事。',
     isFullAuth(perms) ? '完全授权下你可以使用全部能力，但仍不得声称做过实际未做的事。' : ''
-  ].filter(Boolean).join('\n'))
+  ].filter(Boolean).join('\n'), true)
 
   /* 数据文件属于用户侧内容，只在 user 通道出现；AI↔AI 需要就由上级写进派单 */
   const dataBlock = dataFileManifest(agent)
-  if (dataBlock && channel === 'user') parts.push(dataBlock)
+  if (dataBlock && channel === 'user') push('data', '数据文件清单', dataBlock)
 
   /* 工具清单：让成员明确知道自己有哪些工具、叫什么名字、能做什么。
      真正的调用通过函数调用（tool call）完成，这里只负责「告知」。
@@ -605,22 +654,41 @@ export function buildSystemPrompt (agent, opts = {}) {
   const toolProvider = providerById(agent.providerId)
   const toolSchemas = toolProvider && providerSupportsTools(toolProvider) ? toolSchemasFor(agent) : []
   if (toolSchemas.length) {
-    parts.push([
+    push('tools', '工具清单', [
       '## 可用工具',
       `当前有 ${toolSchemas.length} 个工具。要执行操作就直接发起 tool call，不要用文字假装调用，也不要编造结果。`,
       '缺少会改变方案的关键信息、需求有歧义或需用户在互斥方案中做选择时，调用 ask_user_question 一次问一个主题；信息已明确时不要问，工具不可用时才写进正文。用户说「测试提问工具」时立即真实调用。',
+      ...(toolSchemas.some((t) => t.function.name === 'memory_recall')
+        ? ['回忆过去的项目、做过的决定、踩过的坑之前，先用 memory_recall 查一次：默认只返回权重、最近触发时间与权重近/远邻居，不拉正文，需要细节才传 mode=full。不要改去用 memory_context 取全量回忆文件，也不要凭印象编。']
+        : []),
+      ...(toolSchemas.some((t) => t.function.name === 'memory_time')
+        ? [
+          '问到「现在该做什么 / 我这个点通常干嘛 / 这周做了什么」时，先用 memory_time 取真实记录；它的权重按「周几 + 小时」的跨周重复计算，跨周样本不足就直说，不要拿一次爆发当规律、也不要替用户编作息。',
+          '问到「项目现在该做什么 / 这个阶段常收到什么指令 / 走到什么时候开始需要这类工作」时，用 memory_time 的 action=phase：阶段由用户自己的事件进程决定，概率会随近期变化漂移；样本不足就直说，不要按通用开发流程替他推断。'
+        ]
+        : []),
+      ...(toolSchemas.some((t) => t.function.name === 'memory_observe')
+        ? ['用户说出打算或偏好（想吃什么、待会要做什么、喜欢什么）时，用 memory_observe 记一条近期观察：只记录、不立刻替他执行；到合适的时间点由时间网生成具体询问。聊天记录等敏感内容必须由用户明确给出，不要自己去翻文件。']
+        : []),
       '',
       ...toolSchemas.slice(0, 24).map((t) => `- ${t.function.name}：${t.function.description}`)
-    ].join('\n'))
+    ].join('\n'), true)
   }
 
   const think = Number(state.settings.thinking ?? 50)
   const mode = THINK_MODE(think)
-  parts.push(`## 本轮思考强度：${mode}\n${THINK_HINT[mode]}`)
+  push('thinking', '思考强度', `## 本轮思考强度：${mode}\n${THINK_HINT[mode]}`)
 
-  parts.push('## 输出要求\n用简体中文回复。不要输出角色扮演式的旁白，不要用「好的，我来……」开头。')
+  push('output', '输出要求', '## 输出要求\n用简体中文回复。不要输出角色扮演式的旁白，不要用「好的，我来……」开头。', true)
 
-  return parts.join('\n\n')
+  return sections
+}
+
+export function buildSystemPrompt (agent, opts = {}) {
+  return promptSections(agent, opts)
+    .filter((section) => section.fixed || contextLayerOn(section.key))
+    .map((section) => section.text)
+    .join('\n\n')
 }
 
 export function buildMessages (agent, userContent, history = [], opts = {}) {

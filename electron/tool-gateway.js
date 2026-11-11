@@ -58,6 +58,20 @@ function capabilitiesFor (serverId, tool) {
     case 'kb_prune':
     case 'kb_init':
       return ['knowledge.write']
+    case 'memory_query':
+    case 'memory_context':
+    case 'memory_recall':
+    case 'memory_time':
+    case 'memory_observe':
+    case 'memory_kb':
+    case 'memory_inbox':
+      return ['memory']
+    case 'memory_write':
+    case 'memory_knowledge':
+      return ['memory']
+    case 'security_check':
+    case 'security_ledger':
+      return ['memory']
     default:
       return ['external']
   }
@@ -155,6 +169,8 @@ function createToolGateway ({ configDir }) {
       approved: Boolean(approval && approval.ok !== false && approval.source),
       approvalSource: approval ? String(approval.source || '') : '',
       approvalId: approval ? String(approval.id || '') : '',
+      /* 出站闸门编号：把「工具被允许」和「内容被批准」两条记录对起来 */
+      securityGate: String(payload.securityGate || ''),
       clientApprovalIgnored: Boolean(payload.clientApprovalIgnored),
       ok: result ? Boolean(result.ok) : false,
       error: result && result.error ? String(result.error).slice(0, 500) : '',

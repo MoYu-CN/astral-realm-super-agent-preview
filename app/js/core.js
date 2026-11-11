@@ -22,6 +22,26 @@ export function messagesOf (channel) {
   return state.messages.filter((m) => channelOf(m) === channel)
 }
 
+/* ------------------------------------------------- 超级智能体的直连会话 */
+
+/* 它不挂在任何项目上：左侧独立成条，点进去主对话区就是一条普通会话。
+   消息存自己的文件，切项目、换成员都不会带走或污染它。 */
+export const SUPER_THREAD = 'super'
+
+export function superChatActive () {
+  return Boolean(state.superChat && state.superChat.active)
+}
+
+export function superMessages () {
+  return (state.superChat && state.superChat.messages) || []
+}
+
+/* 消息 id 在两套会话里都可能有，统一从这里取；
+   渲染层不必关心当前在哪条线上，重绘才能复用同一套 DOM 逻辑。 */
+export function findMsg (id) {
+  return state.messages.find((m) => m.id === id) || superMessages().find((m) => m.id === id) || null
+}
+
 /* 旧的工具记录是「🔧 服务器 · 工具\n完成：明细」的 system 消息。
    加载时迁移成 kind:'tool'，让历史记录和新记录共用同一套折叠展示。 */
 export function migrateToolLog (msg) {
@@ -158,6 +178,10 @@ export const state = {
   currentRunCapability: '',
   usage: null,
   contextSpec: 'auto',
+  hardContext: null,
+  /* 超级智能体的直连会话：不挂在任何项目上，切项目也不影响它。
+     active 为真时主对话区显示的是这一条线，而不是项目会话。 */
+  superChat: { active: false, loaded: false, messages: [], memory: [] },
   bridge: { port: 0, token: '', running: false },
   dirs: {},
   version: '0.0.0'
@@ -185,6 +209,29 @@ export const bus = {
     }
   }
 }
+
+/* 每条消息的完整原文都写入知识库；这里只负责“原样记录”，
+   不做摘要、不改正文。超级会话另有链接到浓缩记忆的逻辑。 */
+function persistMessageRecord (msg) {
+  if (!msg || !msg.id || !msg.text || !window.astral || !window.astral.messageRecord) return
+  window.astral.messageRecord({
+    id: msg.id,
+    conversationId: msg.thread || 'commander',
+    thread: msg.thread || 'commander',
+    role: msg.role || (msg.kind === 'user' ? 'user' : 'assistant'),
+    sender: msg.kind === 'user' ? '用户' : (msg.name || 'AI'),
+    createdAt: new Date(msg.ts || Date.now()).toISOString(),
+    text: msg.text,
+    meta: { kind: msg.kind, channel: msg.channel || '', agentId: msg.agentId || '' }
+  }).catch(() => {})
+}
+
+bus.on('message:add', (msg) => {
+  if (msg && msg.kind === 'user') persistMessageRecord(msg)
+})
+bus.on('message:done', ({ id } = {}) => {
+  persistMessageRecord(findMsg(id))
+})
 
 /* ------------------------------------------------------------- dom */
 
@@ -509,8 +556,30 @@ export function projectsPayload () {
 
 export function saveProjectsNow () {
   syncActiveProject()
-  return window.astral.saveConfig('projects.json', projectsPayload())
+  const res = window.astral.saveConfig('projects.json', projectsPayload())
+  syncMemoryProjects()
+  return res
 }
+
+/* 项目名就是权重网的节点名：项目结构一变就镜像一次。
+   只是元数据（名字 / 目录 / 摘要），不涉及会话正文；失败不影响保存。 */
+let syncedProjectSig = ''
+function syncMemoryProjects () {
+  if (!window.astral || typeof window.astral.memorySyncProjects !== 'function') return
+  const list = (state.projects || []).map((p) => ({
+    name: p.name,
+    rootPath: p.rootPath || '',
+    summary: p.notes || ''
+  }))
+  const sig = list.map((p) => `${p.name}|${p.rootPath}|${p.summary.length}`).join('\u0000')
+  if (sig === syncedProjectSig) return
+  syncedProjectSig = sig
+  Promise.resolve(window.astral.memorySyncProjects({ projects: list })).catch(() => {
+    syncedProjectSig = ''
+  })
+}
+
+export function syncMemoryProjectsNow () { syncMemoryProjects() }
 
 export function sessionPayload () {
   const user = []

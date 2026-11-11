@@ -9,6 +9,7 @@ import { compactTranscript, compactToolResult, contextTokenBudget, contextHistor
 import { beginRun, finishRun, recordRun, runCancelled, requestCancel } from './runs.js'
 import { currentWorkMode } from './projects.js'
 import { generateTeam, defaultPlanner, applyTeamToProject } from './team-runtime.js'
+import { isGuest } from './roles.js'
 
 /* 标准会话下的自述：默认独立完成。只有用户明确要求多人协作时才申请扩展，
    避免普通问答被模型自行升级成团队编排。扩展标记由编排层消费，不会出现在回复里。 */
@@ -164,6 +165,7 @@ function handoffBlock (channel) {
 function transcriptBlock (excludeId, limit = 8, channel = 'user') {
   const recent = messagesOf(channel)
     .filter((m) => m.id !== excludeId &&
+      !m.ctxReleased &&
       (channel !== 'user' || (m.thread || 'commander') === currentThread) &&
       m.kind !== 'system' && m.kind !== 'plan' && m.kind !== 'handoff' && m.text && m.text.trim())
     .map((m) => ({
@@ -987,6 +989,10 @@ async function runTurn ({ userMsg, resolved, files, target }) {
 export async function submit (input) {
   const raw = String(input || '').trim()
   if (!raw) return { ok: false, message: '空指令' }
+  if (isGuest()) {
+    toast('游客是只读身份：可以浏览，但不能发起模型调用', 'err')
+    return { ok: false, message: '游客只读' }
+  }
   if (state.busy) return { ok: false, message: '上一轮尚未结束' }
   /* AI↔AI 视图是只读的：哪怕绕过界面也不允许从那条线发起会话 */
   if (state.view === 'agent') return { ok: false, message: '协作区只读，请切回「用户 ↔ AI」再发言' }

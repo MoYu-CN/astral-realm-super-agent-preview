@@ -35,13 +35,37 @@
   },
   "context": {
     "historyLimit": 24,
-    "maxTokens": 12000
+    "maxTokens": 12000,
+    "layers": {
+      "persona": true,
+      "identity": true,
+      "project": true,
+      "profile": true,
+      "hard": true,
+      "bio": true,
+      "skills": true,
+      "notes": true,
+      "protocol": true,
+      "data": true,
+      "thinking": true
+    }
   },
   "profile": {
     "name": "",
     "short": "",
     "avatar": "",
-    "likes": ""
+    "likes": "",
+    "role": "admin"
+  },
+  "superAgent": {
+    "name": "星核",
+    "short": "核",
+    "avatar": "",
+    "color": "#c0a0ff",
+    "bio": "常驻星界的超级智能体：记住做过的事、判断是否该主动做事、把任务派给执行层。",
+    "providerId": "",
+    "model": "",
+    "temperature": 0.6
   },
   "permissions": {
     "full": false,

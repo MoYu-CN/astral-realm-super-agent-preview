@@ -31,3 +31,8 @@ vendor/sherpa-onnx/
 *.crt
 Thumbs.db
 .DS_Store
+
+# 本地验证产物（截图 / 抓包临时文件）
+tmp-*.png
+tmp-*.json
+tmp-*.txt

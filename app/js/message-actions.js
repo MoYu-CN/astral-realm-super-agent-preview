@@ -2,12 +2,15 @@
 
 import {
   state, bus, h, md, toast, copyText, fileTypeLabel, timeLabel,
-  activeProject, estimateTextTokens, persist, conversationIsTeam
+  activeProject, estimateTextTokens, persist, conversationIsTeam, findMsg, superChatActive,
+  saveProjectSessionNow
 } from './core.js'
 import { openModal, closeModal, field } from './modal.js'
 import { confirmAction } from './confirm.js'
 import { enhanceMarkdown } from './rich-markdown.js'
 import { icon } from './icons.js'
+import { saveSuperHistoryNow } from './superagent.js'
+import { toggleContextRelease } from './context-release.js'
 import {
   isImageFile, createImageThumb, enhanceMarkdownImages, openImagePreview
 } from './imagepreview.js'
@@ -259,7 +262,7 @@ function viewerHead (msg) {
 }
 
 export function openMessageViewer (msgId, taskId = null) {
-  const msg = state.messages.find((m) => m.id === msgId)
+  const msg = findMsg(msgId)
   if (!msg) return
   if (taskId && msg.kind === 'plan') {
     const task = (msg.tasks || []).find((t) => t.id === taskId)
@@ -312,7 +315,7 @@ export function openMessageViewer (msgId, taskId = null) {
 
 async function editQuestion (msgId) {
   if (state.busy) { toast('协作进行中，暂时不能修改提问', 'err'); return false }
-  const msg = state.messages.find((m) => m.id === msgId)
+  const msg = findMsg(msgId)
   if (!msg || msg.kind !== 'user') return false
   const tail = state.messages.length - state.messages.indexOf(msg) - 1
   const ok = await confirmAction({
@@ -490,13 +493,68 @@ function messageStatsNode (msg) {
   return box
 }
 
+/* 释放上下文：这条不再发给模型（界面保留、可恢复）。
+   与「撤回」不同：不删历史；与预算压缩不同：连摘要都不带。 */
+function releaseButton (msg) {
+  if (msg.contextHidden) {
+    return actionButton('已压缩', '完整记录仅供查看；需要让智能体看原文，请用「引用原文」', () => {}, 'release-on')
+  }
+  const released = () => Boolean(msg.ctxReleased)
+  const paint = (btn) => {
+    const on = released()
+    btn.textContent = on ? '恢复' : '释放'
+    btn.title = on
+      ? '这条已不占用上下文；点恢复后下一轮重新发给模型'
+      : '释放上下文：这条不再发给模型，界面保留、可随时恢复'
+    btn.classList.toggle('release-on', on)
+  }
+  const btn = actionButton(released() ? '恢复' : '释放', '', async () => {
+    toggleContextRelease(msg)
+    bus.emit('message:update', { id: msg.id, patch: { ctxReleased: Boolean(msg.ctxReleased) } })
+    bus.emit('context:released')
+    toast(msg.ctxReleased ? '已释放：下一轮起不再发给模型' : '已恢复：下一轮重新带上这条', 'ok')
+    paint(btn)
+    try {
+      if (msg.thread === 'super' || superChatActive()) saveSuperHistoryNow()
+      else await saveProjectSessionNow()
+    } catch { /* 存档失败时本次内存选择仍生效 */ }
+  }, 'release')
+  paint(btn)
+  return btn
+}
+
+/* 完整原文仍留在用户界面，但不进模型上下文。用户需要让智能体看原文时，
+   显式把这段话作为下一条消息的引用发出去，而不是偷偷恢复上下文。 */
+function quoteOriginalForTarget (msg) {
+  const input = document.querySelector('#input')
+  const text = String((msg && msg.text) || '').trim()
+  if (!input || !text) return
+  const block = `【引用原文】\n${text}`
+  input.value = [String(input.value || '').trim(), block].filter(Boolean).join('\n\n')
+  input.focus()
+  toast('已引用原文；发送后会交给当前对话', 'ok')
+}
+
 export function attachMessageActions (node, msg) {
   if (!msg || msg.kind === 'system') return
+  /* 直连会话不参与协作编排：撤回、改写、重新生成都只对项目会话有意义，
+     在这里给按钮只会让人以为能改动作，所以只留查看、复制、引用与释放。 */
+  const direct = msg.thread === 'super'
   const bar = h('div', { class: 'msg-actions', onclick: (e) => e.stopPropagation() })
   bar.append(actionButton('查看', '只读查看完整内容', () => openMessageViewer(msg.id)))
   if (msg.kind === 'user') {
+    bar.append(actionButton('复制', '复制消息文本', () => copyToClipboard(msg.text || '', '消息已复制')))
+    if (direct) {
+      bar.append(
+        actionButton('引用原文', '把这条原文作为新消息引用给当前对话', () => quoteOriginalForTarget(msg)),
+        releaseButton(msg)
+      )
+      node.append(bar)
+      return
+    }
     bar.append(
-      actionButton('复制', '复制消息文本', () => copyToClipboard(msg.text || '', '消息已复制')),
+      actionButton('引用原文', '把这条原文作为新消息引用给当前对话', () => quoteOriginalForTarget(msg)),
+      releaseButton(msg),
       actionButton('修改提问', '撤回这条提问及后续回复，再把原文放回输入框修改', () => editQuestion(msg.id)),
       actionButton('撤回', '删除这条消息及之后同线程的回复/任务', async () => {
         if (state.busy) { toast('协作进行中，暂时不能撤回', 'err'); return }
@@ -514,7 +572,9 @@ export function attachMessageActions (node, msg) {
     )
   } else if (msg.kind === 'agent') {
     bar.append(actionButton('复制', '复制原始回复（Markdown）', () => copyToClipboard(msg.text || '', '回复已复制')))
-    if (msg.channel === 'user') {
+    bar.append(actionButton('引用原文', '把这条回复原文作为新消息引用给当前对话', () => quoteOriginalForTarget(msg)))
+    bar.append(releaseButton(msg))
+    if (msg.channel === 'user' && !direct) {
       bar.append(actionButton('重新生成', '重新生成最新一轮回复；保留用户消息与附件', () => {
         if (!canRegenerate(msg.id)) {
           toast('只能重新生成最新一条 AI 回复', 'err')
@@ -536,7 +596,7 @@ export function attachMessageActions (node, msg) {
 
 /* 回复收口时补统计：消息节点是复用的，不能靠整条重绘把这一行刷出来 */
 bus.on('message:stats', ({ id } = {}) => {
-  const msg = state.messages.find((m) => m.id === id)
+  const msg = findMsg(id)
   if (!msg) return
   const escaped = window.CSS && CSS.escape ? CSS.escape(String(id)) : String(id)
   const node = document.querySelector(`.msg[data-id="${escaped}"]`)
@@ -557,3 +617,4 @@ export function attachPlanTaskActions (row, planMsg, task) {
   )
   row.append(box)
 }
+

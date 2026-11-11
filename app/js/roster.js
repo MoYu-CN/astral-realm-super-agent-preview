@@ -1,9 +1,10 @@
 /* roster.js — 编制列表与成员编辑器 */
 
-import { state, bus, $, h, agentById, persist, toast, uid, pickAvatar, activeProject, normalizeConversationMode, soloAgent, conversationIsTeam, saveProjectSessionNow, saveProjectsNow } from './core.js'
+import { state, bus, $, h, agentById, persist, toast, uid, pickAvatar, activeProject, normalizeConversationMode, soloAgent, conversationIsTeam, saveProjectSessionNow, saveProjectsNow, superChatActive } from './core.js'
 import { openModal, closeModal, field } from './modal.js'
 import { ROLE_LABEL } from './llm.js'
 import { applyDefaultPerms } from './permissions.js'
+import { leaveSuperChat } from './superagent.js'
 
 const ROLE_ORDER = ['commander', 'deputy', 'executor']
 const RANK = { commander: 0, deputy: 1, executor: 2 }
@@ -108,6 +109,8 @@ function rowNode (agent, opts = {}) {
 }
 
 export function select (id) {
+  /* 点成员就是「跟这位说话」，先离开直连会话 */
+  if (superChatActive()) leaveSuperChat()
   /* 单独会话只有这一位：点它不该取消选中，保持高亮与编辑目标稳定 */
   state.activeAgentId = conversationIsTeam()
     ? (state.activeAgentId === id ? null : id)

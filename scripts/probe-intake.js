@@ -69,6 +69,18 @@ async function main () {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'astral-intake-probe-'))
   fs.mkdirSync(dir, { recursive: true })
 
+  /* 应用本身可能正在跑，默认 45890 已被它占着：探针另找一个空端口。
+     否则「端口被占」会被误读成「入口起不来」。 */
+  const freePort = await new Promise((resolve) => {
+    const probe = require('node:net').createServer()
+    probe.once('error', () => resolve(0))
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address()
+      probe.close(() => resolve(port))
+    })
+  })
+  if (freePort) fs.writeFileSync(path.join(dir, 'intake.json'), JSON.stringify({ port: freePort }), 'utf8')
+
   /* ---------- 数据面：不启界面，先把库点满 ---------- */
   const { createMemoryStore } = require(path.join(ROOT, 'electron', 'memory', 'store.js'))
   const { createIntake, memorySecretBox } = require(path.join(ROOT, 'electron', 'intake', 'index.js'))
@@ -110,6 +122,15 @@ async function main () {
   const stats = store.inbox({ action: 'stats' }).data
   check('统计：三条渠道、今日有数', stats.channels === 3 && stats.today >= 4, JSON.stringify(stats.routes))
 
+  /* 关键一条：开关打开后，超级智能体的常驻上下文里必须看得到「我在听什么」 */
+  const ctx = store.hardContext.prompt().data.text
+  const block = ((ctx.split('### 消息接入（实时）')[1] || '').split('\n### ')[0] || '')
+  check('首流：接入状态写进常驻上下文', /### 消息接入（实时）/.test(ctx) && /已接 \d+ 条渠道/.test(block),
+    (block.split('\n').filter(Boolean)[0] || '').slice(0, 60))
+  check('首流：告诉 AI 外面有没有人等它', /条在等你|今日 \d+ 条/.test(block), (block.split('\n').filter(Boolean)[1] || '').slice(0, 60))
+  const viaTool = store.inbox({ action: 'brief' }).data
+  check('首流：工具和上下文是同一段', viaTool.text === block.trim(), String((viaTool.text || '').length) + ' 字')
+
   const server = await intake.startServer()
   check('入口：本地 HTTP 起来了', server.ok === true, '127.0.0.1:' + server.port)
   if (server.ok) {
@@ -140,13 +161,18 @@ async function main () {
       if (!base.ok) return base
       const body = document.querySelector('#modal-root .modal-body')
       const text = body ? body.innerText : ''
+      /* 真窗口里再问一次主进程：常驻上下文是不是真的带上了接入那一块 */
+      let ctx = ''
+      try { const res = await window.astral.memoryPrompt(); ctx = (res && res.text) || '' } catch {}
       return {
         ok: true,
+        ctxHasIntake: /### 消息接入（实时）/.test(ctx),
         rows: document.querySelectorAll('#modal-root .mini-row').length,
         mentionsHook: /CI 告警/.test(text),
         mentionsWechat: /微信/.test(text),
         mentionsRisk: /只读|官方|有风险/.test(text),
         mentionsInbox: /收件箱/.test(text),
+        mentionsContext: /常驻上下文/.test(text),
         sample: text.slice(0, 120)
       }
     })()`,
@@ -161,6 +187,8 @@ async function main () {
   check('界面：渠道卡片渲染出来', (info.rows || 0) >= 8, (info.rows || 0) + ' 行')
   check('界面：认得出已接入的渠道', info.mentionsHook === true && info.mentionsWechat === true)
   check('界面：风险标签与收件箱都在', info.mentionsRisk === true && info.mentionsInbox === true)
+  check('界面：告诉用户已写进常驻上下文', info.mentionsContext === true)
+  check('界面：真窗口取到的提示词里带接入块', info.ctxHasIntake === true)
 
   const failed = results.filter((item) => !item.ok)
   console.log(`\n${results.length - failed.length}/${results.length} 项通过`)

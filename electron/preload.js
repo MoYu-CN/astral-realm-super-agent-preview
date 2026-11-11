@@ -85,6 +85,13 @@ contextBridge.exposeInMainWorld('astral', {
   messageDigest: (payload) => ipcRenderer.invoke('astral:message:digest', payload),
   messageGet: (payload) => ipcRenderer.invoke('astral:message:get', payload),
   messageDigests: (payload) => ipcRenderer.invoke('astral:message:digests', payload),
+  messageWeight: (payload) => ipcRenderer.invoke('astral:message:weight', payload),
+  messageEdges: (payload) => ipcRenderer.invoke('astral:message:edges', payload),
+  messageDimensions: (payload) => ipcRenderer.invoke('astral:message:dimensions', payload),
+  messageGraph: (payload) => ipcRenderer.invoke('astral:message:graph', payload),
+  teamToolboxSave: (payload) => ipcRenderer.invoke('astral:team:toolbox:save', payload),
+  teamToolboxGet: (payload) => ipcRenderer.invoke('astral:team:toolbox:get', payload),
+  teamToolboxFind: (payload) => ipcRenderer.invoke('astral:team:toolbox:find', payload),
   memorySyncProjects: (payload) => ipcRenderer.invoke('astral:memory:syncProjects', payload),
   memoryNet: () => ipcRenderer.invoke('astral:memory:net'),
   memoryKb: (payload) => ipcRenderer.invoke('astral:memory:kb', payload),
@@ -136,5 +143,9 @@ contextBridge.exposeInMainWorld('astral', {
   },
   onMaximizeChange: (handler) => {
     ipcRenderer.on('win:maximized', (_event, value) => handler(Boolean(value)))
+  },
+  /* 新消息到达：渲染层据此刷新常驻上下文，让「消息接入」那块实时可见 */
+  onIntakeMessage: (handler) => {
+    ipcRenderer.on('astral:intake:new', (_event, payload) => handler(payload || {}))
   }
 })

@@ -17,6 +17,7 @@ const weights = require('./weights.js')
 const kbIndex = require('./kb-index.js')
 const { createInbox } = require('./inbox.js')
 const { createSecurityStore } = require('./security.js')
+const inboxBrief = require('../intake/brief.js')
 
 const ROLE = Object.freeze({ SUPER: 'super', EXECUTOR: 'executor', EXTERNAL: 'external' })
 const PROPOSAL_RESULTS = ['接受', '拒绝', '已下发任务']
@@ -2134,6 +2135,9 @@ function createMemoryStore ({
       case 'messages': return ok(inboxBox.listMessages(args))
       case 'threads': return ok(inboxBox.listThreads(args))
       case 'stats': return ok({ ...inboxBox.stats(), security: securityBox.stats() })
+      /* 首流那一小块：开了哪些渠道、外面有几条在等、怎么取全文。
+         和常驻上下文里「消息接入（实时）」是同一段文本，不从两处各写一遍。 */
+      case 'brief': return ok(inboxBrief.lines(db))
       case 'handled': return ok(inboxBox.markHandled(args.ids))
       case 'clear': return ok(inboxBox.clearMessages(args))
       default: return fail('未知的收件箱动作：' + (action || '(空)'))
@@ -2232,17 +2236,98 @@ function createMemoryStore ({
   /* --------------------------------------------------------- 消息原文 / 浓缩
      原文表只追加：即使同一个 id 再写，也不会覆盖历史正文。
      浓缩表可以更新权重与内容，但通过 message_id 永远指回原文。 */
+  function nextMessageCode () {
+    const a = db.prepare("SELECT MAX(CAST(SUBSTR(code, 2) AS INTEGER)) AS n FROM message_records WHERE code LIKE 'M%'").get()
+    const b = db.prepare("SELECT MAX(CAST(SUBSTR(code, 2) AS INTEGER)) AS n FROM message_digests WHERE code LIKE 'M%'").get()
+    return 'M' + String(Math.max(Number(a.n) || 0, Number(b.n) || 0) + 1).padStart(6, '0')
+  }
+
+  function oneLineOf (text, max = 120) {
+    const clean = String(text || '').replace(/\s+/g, ' ').trim()
+    return clean.length > max ? clean.slice(0, max - 1) + '…' : clean
+  }
+
+  function relationTokens (text) {
+    const clean = String(text || '').toLowerCase().replace(/\s+/g, '')
+    const set = new Set()
+    for (let i = 0; i < clean.length - 1; i += 1) set.add(clean.slice(i, i + 2))
+    return set
+  }
+
+  function relationScore (a, b) {
+    const left = relationTokens(a)
+    const right = relationTokens(b)
+    if (!left.size || !right.size) return 0
+    let hit = 0
+    for (const token of left) if (right.has(token)) hit += 1
+    return Math.max(0, Math.min(1, hit / Math.max(1, left.size + right.size - hit)))
+  }
+
+  function timeWeightOf (iso) {
+    const at = Date.parse(iso || '')
+    if (!at) return 0
+    const days = Math.max(0, (Date.now() - at) / 86400000)
+    return Math.max(0, Math.min(1, Math.exp(-days / 30)))
+  }
+
+  /* 动态维度不写死：模型/主智能体给出什么因子，就登记什么因子。 */
+  function registerDimensions (dimensions, at = now()) {
+    if (!dimensions || typeof dimensions !== 'object') return
+    for (const [name, value] of Object.entries(dimensions)) {
+      const key = String(name || '').trim()
+      if (!key) continue
+      db.prepare(`
+        INSERT INTO weight_dimensions (name, first_seen, last_seen, uses, meta)
+        VALUES (?, ?, ?, 1, ?)
+        ON CONFLICT(name) DO UPDATE SET
+          last_seen = excluded.last_seen,
+          uses = uses + 1,
+          meta = excluded.meta
+      `).run(key, at, at, JSON.stringify({ lastValue: value }))
+    }
+  }
+
+  function weightDimensions (input = {}) {
+    requireSuper(input.actor)
+    const rows = db.prepare('SELECT * FROM weight_dimensions ORDER BY uses DESC, last_seen DESC LIMIT ?')
+      .all(Math.max(1, Math.min(Number(input.limit) || 100, 200)))
+    return ok(rows)
+  }
+
+  function messageGraph (input = {}) {
+    requireSuper(input.actor)
+    const limit = Math.max(1, Math.min(Number(input.limit) || 80, 200))
+    const nodes = db.prepare(`
+      SELECT code, message_id, one_line, digest, created_at, total_weight, relation_weight, edge_weight
+      FROM (
+        SELECT d.*, COALESCE((SELECT SUM(e.relation_weight) FROM weight_edges e
+          WHERE e.from_code = d.code OR e.to_code = d.code), 0) AS edge_weight
+        FROM message_digests d WHERE d.code IS NOT NULL
+      )
+      ORDER BY created_at DESC LIMIT ?
+    `).all(limit)
+    const codes = new Set(nodes.map((node) => node.code))
+    const edges = db.prepare('SELECT from_code, to_code, relation_weight, reason FROM weight_edges ORDER BY relation_weight DESC LIMIT 500')
+      .all()
+      .filter((edge) => codes.has(edge.from_code) && codes.has(edge.to_code))
+    return ok({ nodes, edges })
+  }
+
   function writeMessageRecord (input = {}) {
     requireSuper(input.actor)
     const id = String(input.id || randomUUID())
     const text = String(input.text == null ? '' : input.text)
     if (!text.trim()) throw new Error('message_record 需要 text')
+    const existing = db.prepare('SELECT * FROM message_records WHERE id = ?').get(id)
+    if (existing) return ok(existing, { inserted: false })
+    const code = String(input.code || '').trim() || nextMessageCode()
     const info = db.prepare(`
-      INSERT OR IGNORE INTO message_records
-        (id, conversation_id, thread, role, sender, created_at, text, meta)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO message_records
+        (id, code, conversation_id, thread, role, sender, created_at, text, meta)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
+      code,
       input.conversationId || input.conversation_id || null,
       input.thread || null,
       input.role || 'user',
@@ -2260,47 +2345,129 @@ function createMemoryStore ({
     const messageId = String(input.messageId || input.message_id || '').trim()
     const digest = String(input.digest || '').trim()
     if (!messageId || !digest) throw new Error('message_digest 需要 messageId 和 digest')
-    const id = String(input.id || randomUUID())
+    const record = db.prepare('SELECT * FROM message_records WHERE id = ?').get(messageId)
+    if (!record) throw new Error('message_digest 找不到对应原文：' + messageId)
+    const code = String(input.code || record.code || '').trim() || nextMessageCode()
     const at = now()
+    const createdAt = input.createdAt || record.created_at || at
+    const conversationId = input.conversationId || input.conversation_id || record.conversation_id || null
+    const eventWeight = typeof input.eventWeight === 'number' ? input.eventWeight : 1
+    const previousRows = db.prepare(`
+      SELECT code, digest FROM message_digests
+      WHERE conversation_id = ?
+        AND message_id <> ?
+        AND code IS NOT NULL
+      ORDER BY created_at DESC LIMIT 6
+    `).all(conversationId, messageId)
+    const autoRelation = previousRows.reduce((max, row) => Math.max(max, relationScore(digest, row.digest)), 0)
+    const relationWeight = typeof input.relationWeight === 'number' ? input.relationWeight : autoRelation
+    const dynamicWeight = typeof input.dynamicWeight === 'number'
+      ? input.dynamicWeight
+      : (typeof input.weight === 'number' ? input.weight : null)
+    const totalWeight = typeof input.totalWeight === 'number' ? input.totalWeight : dynamicWeight
+    const dimensions = input.dimensions && typeof input.dimensions === 'object'
+      ? input.dimensions
+      : (input.dimensionsJson && typeof input.dimensionsJson === 'object' ? input.dimensionsJson : {})
+    const weightJson = {
+      time: timeWeightOf(createdAt),
+      event: eventWeight,
+      relation: relationWeight,
+      dynamic: dynamicWeight,
+      ...(input.weightJson && typeof input.weightJson === 'object' ? input.weightJson : {}),
+      ...dimensions
+    }
+    registerDimensions(dimensions, at)
+    const oneLine = input.oneLine || input.one_line || oneLineOf(digest, 120)
+    const timeText = input.timeText || input.time_text || createdAt
+    const metadata = input.metadata && typeof input.metadata === 'object'
+      ? JSON.stringify(input.metadata)
+      : (input.metadata || null)
+
     db.prepare(`
       INSERT INTO message_digests
-        (id, message_id, conversation_id, project_id, digest, weight, weight_json,
-         scorer, status, created_at, updated_at, metadata)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, code, message_id, conversation_id, project_id, digest, one_line, time_text,
+         weight, weight_json, time_weight, event_weight, relation_weight, dynamic_weight,
+         total_weight, dimensions_json, scorer, status, created_at, updated_at, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(message_id) DO UPDATE SET
+        code = excluded.code,
         conversation_id = excluded.conversation_id,
         project_id = excluded.project_id,
         digest = excluded.digest,
+        one_line = excluded.one_line,
+        time_text = excluded.time_text,
         weight = excluded.weight,
         weight_json = excluded.weight_json,
+        time_weight = excluded.time_weight,
+        event_weight = excluded.event_weight,
+        relation_weight = excluded.relation_weight,
+        dynamic_weight = excluded.dynamic_weight,
+        total_weight = excluded.total_weight,
+        dimensions_json = excluded.dimensions_json,
         scorer = excluded.scorer,
         status = excluded.status,
         updated_at = excluded.updated_at,
         metadata = excluded.metadata
     `).run(
-      id,
+      String(input.id || randomUUID()),
+      code,
       messageId,
-      input.conversationId || input.conversation_id || null,
+      conversationId,
       input.projectId || input.project_id || null,
       digest,
-      typeof input.weight === 'number' ? input.weight : null,
-      input.weightJson && typeof input.weightJson === 'object' ? JSON.stringify(input.weightJson) : (input.weight_json || null),
+      oneLine,
+      timeText,
+      typeof input.weight === 'number' ? input.weight : dynamicWeight,
+      JSON.stringify(weightJson),
+      timeWeightOf(createdAt),
+      eventWeight,
+      relationWeight,
+      dynamicWeight,
+      totalWeight,
+      JSON.stringify(dimensions),
       input.scorer || null,
       input.status || 'active',
-      input.createdAt || input.created_at || at,
+      createdAt,
       at,
-      input.metadata && typeof input.metadata === 'object' ? JSON.stringify(input.metadata) : null
+      metadata
     )
-    const row = db.prepare('SELECT * FROM message_digests WHERE message_id = ?').get(messageId)
-    return ok(row)
+    /* 编号也要回写到原文表，右键用气泡编号即可回查。 */
+    if (!record.code) db.prepare('UPDATE message_records SET code = ? WHERE id = ?').run(code, messageId)
+
+    /* 与最近同会话的少量事件建立动态关联边。 */
+    for (const row of previousRows) {
+      const relation = relationScore(digest, row.digest)
+      if (relation <= 0) continue
+      const edgeId = `${code}->${row.code}`
+      const edge = db.prepare('SELECT relation_weight FROM weight_edges WHERE from_code = ? AND to_code = ?').get(code, row.code)
+      const next = edge ? Math.max(edge.relation_weight, relation) : relation
+      db.prepare(`
+        INSERT INTO weight_edges (id, from_code, to_code, relation_weight, reason, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(from_code, to_code) DO UPDATE SET
+          relation_weight = excluded.relation_weight,
+          updated_at = excluded.updated_at
+      `).run(edgeId, code, row.code, next, '同会话内容关联', at, at)
+    }
+
+    const result = db.prepare('SELECT * FROM message_digests WHERE message_id = ?').get(messageId)
+    return ok(result)
   }
 
   function getMessageRecord (input = {}) {
     requireSuper(input.actor)
     const id = String(input.id || input.messageId || input.message_id || '').trim()
-    if (!id) throw new Error('getMessage 需要 id')
-    const row = db.prepare('SELECT * FROM message_records WHERE id = ?').get(id)
-    return row ? ok(row) : fail('没有这条消息原文：' + id)
+    const code = String(input.code || '').trim()
+    if (!id && !code) throw new Error('getMessage 需要 id 或 code')
+    let row
+    if (id) row = db.prepare('SELECT * FROM message_records WHERE id = ?').get(id)
+    if (!row && code) {
+      const digest = db.prepare('SELECT message_id FROM message_digests WHERE code = ?').get(code)
+      const messageId = digest ? digest.message_id : ''
+      if (messageId) row = db.prepare('SELECT * FROM message_records WHERE id = ?').get(messageId)
+      if (!row) row = db.prepare('SELECT * FROM message_records WHERE code = ?').get(code)
+    }
+    return row ? ok(row) : fail('没有这条消息原文：' + (id || code))
   }
 
   function queryMessageDigests (input = {}) {
@@ -2319,6 +2486,22 @@ function createMemoryStore ({
       clauses.push('message_id = ?')
       args.push(input.messageId || input.message_id)
     }
+    if (input.code) {
+      clauses.push('code = ?')
+      args.push(input.code)
+    }
+    if (input.keyword) {
+      clauses.push('(digest LIKE ? OR one_line LIKE ?)')
+      args.push('%' + input.keyword + '%', '%' + input.keyword + '%')
+    }
+    if (input.from) {
+      clauses.push('created_at >= ?')
+      args.push(input.from)
+    }
+    if (input.to) {
+      clauses.push('created_at <= ?')
+      args.push(input.to)
+    }
     if (input.status) {
       clauses.push('status = ?')
       args.push(input.status)
@@ -2326,9 +2509,113 @@ function createMemoryStore ({
     const limit = Math.max(1, Math.min(Number(input.limit) || 20, 100))
     const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''
     const rows = db.prepare(
-      'SELECT * FROM message_digests' + where + ' ORDER BY created_at DESC LIMIT ?'
+      'SELECT d.*, COALESCE((SELECT SUM(e.relation_weight) FROM weight_edges e WHERE e.from_code = d.code OR e.to_code = d.code), 0) AS edge_weight ' +
+      'FROM message_digests d' + where +
+      ' ORDER BY COALESCE(d.total_weight, -1) DESC, edge_weight DESC, d.created_at DESC LIMIT ?'
     ).all(...args, limit)
     return ok(rows)
+  }
+
+  function adjustMessageWeight (input = {}) {
+    requireSuper(input.actor)
+    const code = String(input.code || '').trim()
+    if (!code) throw new Error('adjustMessageWeight 需要 code')
+    const row = db.prepare('SELECT * FROM message_digests WHERE code = ?').get(code)
+    if (!row) throw new Error('没有这个浓缩编号：' + code)
+    let previous = {}
+    try { previous = row.dimensions_json ? JSON.parse(row.dimensions_json) : {} } catch { previous = {} }
+    const dimensions = input.dimensions && typeof input.dimensions === 'object'
+      ? { ...previous, ...input.dimensions }
+      : (input.dimensionsJson && typeof input.dimensionsJson === 'object' ? { ...previous, ...input.dimensionsJson } : previous)
+    registerDimensions(dimensions)
+    const dynamic = typeof input.dynamicWeight === 'number' ? input.dynamicWeight : row.dynamic_weight
+    const total = typeof input.totalWeight === 'number' ? input.totalWeight : dynamic
+    db.prepare(`
+      UPDATE message_digests SET
+        dynamic_weight = ?, total_weight = ?, dimensions_json = ?, weight_json = ?,
+        scorer = ?, updated_at = ?
+      WHERE code = ?
+    `).run(
+      dynamic,
+      total,
+      JSON.stringify(dimensions),
+      JSON.stringify({ ...(row.weight_json ? JSON.parse(row.weight_json) : {}), ...dimensions, dynamic }),
+      input.scorer || row.scorer || 'main',
+      now(),
+      code
+    )
+    return ok(db.prepare('SELECT * FROM message_digests WHERE code = ?').get(code))
+  }
+
+  function weightEdges (input = {}) {
+    requireSuper(input.actor)
+    const code = String(input.code || '').trim()
+    if (!code) throw new Error('weightEdges 需要 code')
+    const rows = db.prepare(`
+      SELECT * FROM weight_edges
+      WHERE from_code = ? OR to_code = ?
+      ORDER BY relation_weight DESC LIMIT ?
+    `).all(code, code, Math.max(1, Math.min(Number(input.limit) || 20, 100)))
+    return ok(rows)
+  }
+
+  /* 团队工具箱：项目、进度、团队结构、知识索引与决策独立于会话保存。 */
+  function writeTeamToolbox (input = {}) {
+    requireSuper(input.actor)
+    const projects = Array.isArray(input.projects) ? input.projects : [input]
+    const at = now()
+    for (const project of projects) {
+      const projectId = String(project.projectId || project.project_id || project.id || '').trim()
+      if (!projectId) continue
+      db.prepare(`
+        INSERT INTO team_toolboxes
+          (project_id, name, root_path, progress, plan, task_json, takeover_from,
+           team_json, knowledge_json, decisions_json, plan_updated_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id) DO UPDATE SET
+          name = excluded.name,
+          root_path = excluded.root_path,
+          progress = excluded.progress,
+          plan = excluded.plan,
+          task_json = excluded.task_json,
+          takeover_from = excluded.takeover_from,
+          team_json = excluded.team_json,
+          knowledge_json = excluded.knowledge_json,
+          decisions_json = excluded.decisions_json,
+          plan_updated_at = excluded.plan_updated_at,
+          updated_at = excluded.updated_at
+      `).run(
+        projectId,
+        project.name || null,
+        project.rootPath || project.root_path || null,
+        project.progress || null,
+        project.plan || null,
+        JSON.stringify(project.task || project.taskBrief || project.taskJson || {}),
+        project.takeoverFrom || project.takeover_from || null,
+        JSON.stringify(project.team || project.teamJson || {}),
+        JSON.stringify(project.knowledge || project.knowledgeJson || []),
+        JSON.stringify(project.decisions || project.decisionsJson || []),
+        at,
+        at
+      )
+    }
+    return ok({ count: projects.length })
+  }
+
+  function findTeamToolbox (input = {}) {
+    requireSuper(input.actor)
+    const rootPath = String(input.rootPath || input.root_path || '').trim()
+    if (!rootPath) return fail('findTeamToolbox 需要 rootPath')
+    const row = db.prepare('SELECT * FROM team_toolboxes WHERE root_path = ? COLLATE NOCASE ORDER BY updated_at DESC LIMIT 1').get(rootPath)
+    return ok(row || null)
+  }
+
+  function getTeamToolbox (input = {}) {
+    requireSuper(input.actor)
+    const projectId = String(input.projectId || input.project_id || input.id || '').trim()
+    if (!projectId) throw new Error('getTeamToolbox 需要 projectId')
+    const row = db.prepare('SELECT * FROM team_toolboxes WHERE project_id = ?').get(projectId)
+    return row ? ok(row) : fail('没有这个团队工具箱：' + projectId)
   }
 
   return {
@@ -2341,6 +2628,13 @@ function createMemoryStore ({
     writeMessageDigest: safe(writeMessageDigest),
     getMessageRecord: safe(getMessageRecord),
     queryMessageDigests: safe(queryMessageDigests),
+    adjustMessageWeight: safe(adjustMessageWeight),
+    weightEdges: safe(weightEdges),
+    weightDimensions: safe(weightDimensions),
+    messageGraph: safe(messageGraph),
+    writeTeamToolbox: safe(writeTeamToolbox),
+    findTeamToolbox: safe(findTeamToolbox),
+    getTeamToolbox: safe(getTeamToolbox),
     kb: safe(kb),
     inbox,
     security,

@@ -500,7 +500,8 @@ function head (msg) {
     roleTitle ? h('span', { class: 'sep', text: '·' }) : null,
     h('span', { class: 'model', text: msg.meta && msg.meta.model ? msg.meta.model : (teamMode ? ROLE_LABEL[msg.role] || '' : '') }),
     h('span', { class: 'sep', text: '·' }),
-    h('span', { class: 'time', text: timeLabel(msg.ts) })
+    h('span', { class: 'time', text: timeLabel(msg.ts) }),
+    msg.code ? h('span', { class: 'msg-code', text: msg.code, title: '右键可按此编号回查原文' }) : null
   )
 }
 
@@ -522,7 +523,8 @@ function renderBody (id) {
         h('div', { class: 'user-id' },
           h('div', { class: 'user-line' },
             h('span', { class: 'u-short', text: profile.short || '你' }),
-            h('span', { class: 'u-name', text: profile.name || '我' })
+            h('span', { class: 'u-name', text: profile.name || '我' }),
+            msg.code ? h('span', { class: 'msg-code', text: msg.code, title: '右键可按此编号回查原文' }) : null
           ),
           h('div', { class: 'u-time', text: timeLabel(msg.ts) })
         ),
@@ -1118,6 +1120,12 @@ export function mountStream () {
     if (!msg) return
     if (patch) Object.assign(msg, patch)
     const node = nodes.get(id)
+    if (node && msg.code) {
+      const host = node.querySelector('.msg-head') || node.querySelector('.user-line')
+      if (host && !host.querySelector('.msg-code')) {
+        host.append(h('span', { class: 'msg-code', text: msg.code, title: '右键可按此编号回查原文' }))
+      }
+    }
     const ava = node && node.querySelector('.msg-ava')
     if (ava) ava.classList.toggle('busy', Boolean(msg.streaming))
     /* 释放/恢复只改样式标记，不需要整条重绘 */

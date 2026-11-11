@@ -477,6 +477,19 @@ async function boot () {
     refreshHardContext().catch(() => {})
   })
 
+  /* 渠道开关被拨动、或外面来了新消息：常驻上下文要立刻重取。
+     两次之间至少隔 1.5 秒 —— 群里刷屏时不该每来一条就查一次库。 */
+  let contextRefreshTimer = 0
+  function queueContextRefresh () {
+    if (contextRefreshTimer) return
+    contextRefreshTimer = setTimeout(() => {
+      contextRefreshTimer = 0
+      refreshHardContext().catch(() => {})
+    }, 1500)
+  }
+  window.addEventListener('astral:memory-context-refresh', queueContextRefresh)
+  if (window.astral.onIntakeMessage) window.astral.onIntakeMessage(queueContextRefresh)
+
     await dismissSplash()
     await maybeAskKnowledgePlugin()
     await loadPlugins()

@@ -11,6 +11,12 @@ import { confirmAction } from './confirm.js'
 
 let cache = { channels: [], kinds: [], stats: null, port: 0 }
 
+/* 开关一拨，超级智能体的常驻上下文就得跟着变：
+   否则「打开了」只有界面上知道，提示词里那块「消息接入」要等下次切窗口才出现。 */
+function notifyPromptChanged () {
+  window.dispatchEvent(new CustomEvent('astral:memory-context-refresh'))
+}
+
 const ROUTE_LABEL = {
   alert: { text: '提醒', cls: 'on' },
   observe: { text: '观察', cls: '' },
@@ -70,6 +76,10 @@ function overviewCard () {
     ),
     h('div', { class: 'hint' },
       '所有渠道走同一套接口：收到的东西先落进收件箱，原文不进上下文，只有摘要、索引和「要不要问你一句」会越界。'),
+    h('div', { class: 'hint' },
+      running
+        ? '已写进超级智能体的常驻上下文：它每一轮都知道开了哪几条、外面有几条在等它，需要细节时用 memory_inbox 取。'
+        : '打开任意一条渠道后，超级智能体每一轮都会看到「消息接入」那一小块——开了什么、外面有没有人找它。'),
     h('div', { class: 'mini-row' },
       h('span', {}, '今日收到'),
       h('span', { class: 'hint', text: String(stats.today || 0) }),
@@ -119,6 +129,7 @@ function channelCard () {
               return
             }
             if (on) toast('已启动：' + channel.label, 'ok')
+            notifyPromptChanged()
             await refresh()
           }
         })
@@ -286,6 +297,7 @@ function openChannelDialog (channel, kindPreset = null) {
             if (!saved.ok) { toast(saved.error || '保存失败', 'err'); return }
             closeModal()
             toast('已保存', 'ok')
+            notifyPromptChanged()
             await refresh()
           }
         }, '保存'),
@@ -325,6 +337,7 @@ async function removeChannel (channel) {
   const res = await api('intakeRemove', { id: channel.id })
   if (!res.ok) { toast(res.error || '移除失败', 'err'); return }
   toast('已移除', 'ok')
+  notifyPromptChanged()
   await refresh()
 }
 

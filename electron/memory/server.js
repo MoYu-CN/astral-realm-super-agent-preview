@@ -81,7 +81,7 @@ const TOOLS = [
   },
   {
     name: 'memory_get_context',
-    description: '已由权重网接管：只给常驻硬性上下文、最近活跃的少数项目、权重近/远邻居与最近触发时间，不再组装全量事件正文。',
+    description: '已由权重网与浓缩索引接管：只给常驻硬性上下文、团队工具箱摘要、最近活跃的少数项目、权重近/远邻居与最近触发时间，不组装全量事件正文。',
     inputSchema: {
       type: 'object',
       properties: { project: { type: 'string' }, limit: { type: 'number' } },
@@ -161,11 +161,12 @@ const TOOLS = [
     }
   },
   {
-    name: 'memory_compress',
-    description: '日 / 周 / 月摘要压缩。压缩规则未定，当前返回 not_implemented。',
+    name: 'message_get',
+    description: '按浓缩编号（如 M000001）回查完整原文。默认上下文只带浓缩索引，需要核对事实时才调用；不要把原文批量拉进上下文。',
     inputSchema: {
       type: 'object',
-      properties: { level: { type: 'string', enum: ['day', 'week', 'month'] } },
+      properties: { code: { type: 'string', description: '消息浓缩编号，例如 M000001' } },
+      required: ['code'],
       additionalProperties: false
     }
   }
@@ -190,7 +191,7 @@ function callTool (name, args) {
     case 'memory_time': return service.time(withActor(args))
     case 'memory_observe': return service.time(withActor({ ...args, action: 'observe', source: args.source || 'chat' }))
     case 'knowledge': return service.knowledge(withActor(args))
-    case 'memory_compress': return service.compress()
+    case 'message_get': return service.getMessageRecord(withActor(args))
     default: throw new Error('未知工具：' + name)
   }
 }

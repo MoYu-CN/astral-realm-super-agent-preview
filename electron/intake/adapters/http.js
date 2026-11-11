@@ -65,9 +65,11 @@ function parseOne (item = {}) {
     text,
     attachments: files,
     chatId: pick(item, ['chatId', 'chat', 'room', 'channel', 'conversation']) || 'webhook',
-    chatName: pick(item, ['chatName', 'roomName', 'channelName', 'source', 'feed']) || 'Webhook',
+    /* `chat` 常常是群名而不是 id：拿它当显示名，总比一律显示「Webhook」强 */
+    chatName: pick(item, ['chatName', 'roomName', 'channelName', 'source', 'feed', 'chat']) || 'Webhook',
     senderId: pick(item, ['senderId', 'from', 'userId', 'author']),
-    senderName: pick(item, ['senderName', 'author', 'fromName', 'name']) || '外部',
+    /* `from` 是最常见的写法，兜底也认它，否则界面上一律是「外部」，等于没记住谁说的 */
+    senderName: pick(item, ['senderName', 'author', 'fromName', 'name', 'from', 'sender']) || '外部',
     msgId: pick(item, ['msgId', 'id', 'guid']),
     at: pick(item, ['at', 'time', 'timestamp', 'date', 'pubDate']) || new Date().toISOString(),
     scope: item.scope === 'private' ? 'private' : 'group',

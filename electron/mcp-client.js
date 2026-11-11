@@ -358,14 +358,14 @@ const BUILTIN_TOOLS = [
   },
   {
     name: 'memory_inbox',
-    description: '收件箱（微信 / 企业微信 / QQ / 通知转发统一入口）：看「外面发生了什么」。每条都带分流结果——alert 该问你、observe 该记、knowledge 该沉、archive 该忘。默认只回摘要与来源，原文留在库里：群聊再多也不会把上下文撑爆，要细节再按 chat 追。',
+    description: '收件箱（微信 / 企业微信 / QQ / 通知转发统一入口）：你「听」外面消息的唯一入口。用户把渠道打开后，常驻上下文里会出现「消息接入（实时）」一块，那是同一份摘要。有 alert（@ 你、点名、派活、有时限）就该主动告诉用户，别等着被问；用户问「刚有没有人找我」「群里说什么了」先查这里，不要凭印象编。每条都带分流结果——alert 该问用户、observe 该记、knowledge 该沉、archive 该忘。默认只回摘要与来源，原文留在库里：群聊再多也不会把上下文撑爆，要细节再按 chat 追。',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['recent', 'search', 'threads', 'stats', 'handled'],
-          description: 'recent=最近消息；search=按关键词找；threads=看哪个群最热；stats=总量与分流分布；handled=标记已处理'
+          enum: ['brief', 'channels', 'recent', 'search', 'threads', 'stats', 'handled'],
+          description: 'brief=两三行状态（开了哪几条、外面几条在等你）；channels=开了哪些渠道、跑到什么状态；recent=最近消息；search=按关键词找；threads=看哪个群最热；stats=总量与分流分布；handled=标记已处理'
         },
         route: { type: 'string', enum: ['alert', 'observe', 'knowledge', 'archive'], description: 'recent 只看某一档' },
         channel: { type: 'string', description: '只查某个渠道 id' },

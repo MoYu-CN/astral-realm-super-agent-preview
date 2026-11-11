@@ -11,7 +11,7 @@ const path = require('node:path')
 const { DatabaseSync } = require('node:sqlite')
 const hardContext = require('./hard-context.js')
 
-const SCHEMA_VERSION = 12
+const SCHEMA_VERSION = 15
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS archive_manifest (
    写入后不可修改；上层摘要/浓缩版本只能引用它，不能覆盖它。 */
 CREATE TABLE IF NOT EXISTS message_records (
   id TEXT PRIMARY KEY,
+  code TEXT,
   conversation_id TEXT,
   thread TEXT,
   role TEXT NOT NULL,
@@ -115,15 +116,24 @@ CREATE INDEX IF NOT EXISTS idx_message_records_conversation ON message_records (
 CREATE INDEX IF NOT EXISTS idx_message_records_created ON message_records (created_at);
 
 /* 浓缩记忆：主智能体默认只看这里；它链接回 message_records.id。
-   weight 不是固定常量，由主智能体或独立打分智能体动态写入。 */
+   权重拆成时间、事件、关联、动态四部分；总权重由打分方动态决定，不写死比例。 */
 CREATE TABLE IF NOT EXISTS message_digests (
   id TEXT PRIMARY KEY,
+  code TEXT,
   message_id TEXT NOT NULL,
   conversation_id TEXT,
   project_id TEXT,
   digest TEXT NOT NULL,
+  one_line TEXT,
+  time_text TEXT,
   weight REAL,
   weight_json TEXT,
+  time_weight REAL,
+  event_weight REAL,
+  relation_weight REAL,
+  dynamic_weight REAL,
+  total_weight REAL,
+  dimensions_json TEXT,
   scorer TEXT,
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL,
@@ -132,6 +142,43 @@ CREATE TABLE IF NOT EXISTS message_digests (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_message_digests_message ON message_digests (message_id);
 CREATE INDEX IF NOT EXISTS idx_message_digests_created ON message_digests (created_at);
+
+/* 事件之间的动态关联边：新事件落库时更新最近邻，关系权重随累积变化。 */
+CREATE TABLE IF NOT EXISTS weight_edges (
+  id TEXT PRIMARY KEY,
+  from_code TEXT NOT NULL,
+  to_code TEXT NOT NULL,
+  relation_weight REAL NOT NULL DEFAULT 0,
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(from_code, to_code)
+);
+
+/* 动态权重维度注册表：模型新增的因子会自动登记，不写死枚举。 */
+CREATE TABLE IF NOT EXISTS weight_dimensions (
+  name TEXT PRIMARY KEY,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  uses INTEGER NOT NULL DEFAULT 1,
+  meta TEXT
+);
+
+/* 团队工具箱：项目、进度、团队结构、知识索引与决策，不依赖会话生命周期。 */
+CREATE TABLE IF NOT EXISTS team_toolboxes (
+  project_id TEXT PRIMARY KEY,
+  name TEXT,
+  root_path TEXT,
+  progress TEXT,
+  plan TEXT,
+  task_json TEXT,
+  takeover_from TEXT,
+  team_json TEXT,
+  knowledge_json TEXT,
+  decisions_json TEXT,
+  plan_updated_at TEXT,
+  updated_at TEXT NOT NULL
+);
 
 /* 硬性上下文：每一轮都进入系统提示词的常驻四块。只保留当前版本 + 修订号，
    不存历史正文（历史版本属于审计，不在本库范围）。 */
@@ -571,6 +618,42 @@ function createDb ({ configDir, dbPath } = {}) {
       if (!columns.has(name)) db.exec('ALTER TABLE security_tasks ADD COLUMN ' + name + ' ' + ddl)
     }
   }
+  /* v12 → v13：消息气泡编号、时间/事件/关联/动态权重与权重边。 */
+  if (previous < 13) {
+    const recordCols = new Set(db.prepare('PRAGMA table_info(message_records)').all().map((c) => c.name))
+    if (!recordCols.has('code')) db.exec('ALTER TABLE message_records ADD COLUMN code TEXT')
+    const digestCols = new Set(db.prepare('PRAGMA table_info(message_digests)').all().map((c) => c.name))
+    for (const [name, ddl] of [
+      ['code', 'TEXT'],
+      ['one_line', 'TEXT'],
+      ['time_text', 'TEXT'],
+      ['time_weight', 'REAL'],
+      ['event_weight', 'REAL'],
+      ['relation_weight', 'REAL'],
+      ['dynamic_weight', 'REAL'],
+      ['total_weight', 'REAL'],
+      ['dimensions_json', 'TEXT']
+    ]) {
+      if (!digestCols.has(name)) db.exec('ALTER TABLE message_digests ADD COLUMN ' + name + ' ' + ddl)
+    }
+  }
+  /* v14 → v15：团队工具箱增加工作目录、计划书、任务详情与接管来源。 */
+  if (previous < 15) {
+    const cols = new Set(db.prepare('PRAGMA table_info(team_toolboxes)').all().map((c) => c.name))
+    for (const [name, ddl] of [
+      ['root_path', 'TEXT'],
+      ['plan', 'TEXT'],
+      ['task_json', 'TEXT'],
+      ['takeover_from', 'TEXT'],
+      ['plan_updated_at', 'TEXT']
+    ]) {
+      if (!cols.has(name)) db.exec('ALTER TABLE team_toolboxes ADD COLUMN ' + name + ' ' + ddl)
+    }
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_message_records_code ON message_records (code);')
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_message_digests_code ON message_digests (code);')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_weight_edges_from ON weight_edges (from_code);')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_weight_edges_to ON weight_edges (to_code);')
   /* 旧库在 v10 时没有 event_code，索引必须放在补列之后；
      否则 CREATE TABLE/INDEX 阶段会先报 no such column，升级直接中断。 */
   db.exec('CREATE INDEX IF NOT EXISTS idx_security_tasks_event ON security_tasks (event_code);')
@@ -587,3 +670,8 @@ function createDb ({ configDir, dbPath } = {}) {
 }
 
 module.exports = { createDb, SCHEMA, SCHEMA_VERSION }
+
+
+
+
+

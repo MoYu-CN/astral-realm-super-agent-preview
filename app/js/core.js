@@ -174,6 +174,8 @@ export const state = {
   activeAgentId: null,
   view: 'user',
   busy: false,
+  teamToolbox: null,
+  projectDigests: [],
   currentRunId: '',
   currentRunCapability: '',
   usage: null,
@@ -210,20 +212,48 @@ export const bus = {
   }
 }
 
-/* 每条消息的完整原文都写入知识库；这里只负责“原样记录”，
-   不做摘要、不改正文。超级会话另有链接到浓缩记忆的逻辑。 */
-function persistMessageRecord (msg) {
+/* 每条消息的完整原文都写入知识库；团队/项目消息同时生成一条一行的
+   浓缩索引。超级会话的浓缩索引由 superagent.js 按模型结果写入。 */
+async function persistMessageRecord (msg) {
   if (!msg || !msg.id || !msg.text || !window.astral || !window.astral.messageRecord) return
-  window.astral.messageRecord({
-    id: msg.id,
-    conversationId: msg.thread || 'commander',
-    thread: msg.thread || 'commander',
-    role: msg.role || (msg.kind === 'user' ? 'user' : 'assistant'),
-    sender: msg.kind === 'user' ? '用户' : (msg.name || 'AI'),
-    createdAt: new Date(msg.ts || Date.now()).toISOString(),
-    text: msg.text,
-    meta: { kind: msg.kind, channel: msg.channel || '', agentId: msg.agentId || '' }
-  }).catch(() => {})
+  try {
+    const res = await window.astral.messageRecord({
+      id: msg.id,
+      conversationId: msg.thread || 'commander',
+      thread: msg.thread || 'commander',
+      role: msg.role || (msg.kind === 'user' ? 'user' : 'assistant'),
+      sender: msg.kind === 'user' ? '用户' : (msg.name || 'AI'),
+      createdAt: new Date(msg.ts || Date.now()).toISOString(),
+      text: msg.text,
+      meta: { kind: msg.kind, channel: msg.channel || '', agentId: msg.agentId || '' }
+    })
+    if (!res || !res.ok) return
+    const code = res.data && res.data.code
+    if (code && !msg.code) {
+      msg.code = code
+      bus.emit('message:update', { id: msg.id, patch: { code } })
+    }
+    if (msg.thread === 'super' || !window.astral.messageDigest) return
+    const oneLine = String(msg.text).replace(/\s+/g, ' ').trim().slice(0, 120)
+    const digest = await window.astral.messageDigest({
+      code: code || undefined,
+      messageId: msg.id,
+      conversationId: msg.thread || 'commander',
+      projectId: activeProject() ? activeProject().id : null,
+      digest: oneLine,
+      oneLine,
+      timeText: new Date(msg.ts || Date.now()).toISOString(),
+      createdAt: new Date(msg.ts || Date.now()).toISOString(),
+      eventWeight: 1,
+      scorer: 'message-index'
+    })
+    if (digest && digest.ok && digest.data && digest.data.code) {
+      msg.code = digest.data.code
+      const row = digest.data
+      state.projectDigests = [row, ...(state.projectDigests || []).filter((item) => item.code !== row.code)].slice(0, 30)
+      bus.emit('message:update', { id: msg.id, patch: { code: msg.code } })
+    }
+  } catch { /* 数据库不可用时主进程会走临时文件；界面不因索引失败而中断 */ }
 }
 
 bus.on('message:add', (msg) => {
@@ -530,6 +560,10 @@ function projectRecord (project) {
     name: project.name || '未命名项目',
     rootPath: project.rootPath || '',
     description: project.description || '',
+    progress: project.progress || '',
+    plan: project.plan || '',
+    taskBrief: project.taskBrief || '',
+    takeoverFrom: project.takeoverFrom || '',
     createdAt: project.createdAt || 0,
     updatedAt: project.updatedAt || 0,
     teamTemplateId: project.teamTemplateId || '',
@@ -567,16 +601,29 @@ let syncedProjectSig = ''
 function syncMemoryProjects () {
   if (!window.astral || typeof window.astral.memorySyncProjects !== 'function') return
   const list = (state.projects || []).map((p) => ({
+    projectId: p.id,
     name: p.name,
     rootPath: p.rootPath || '',
-    summary: p.notes || ''
+    summary: p.notes || '',
+    progress: p.progress || '',
+    plan: p.plan || '',
+    taskBrief: p.taskBrief || '',
+    takeoverFrom: p.takeoverFrom || '',
+    team: (p.roster && p.roster.agents) || [],
+    knowledge: p.knowledge || [],
+    decisions: p.decisions || []
   }))
-  const sig = list.map((p) => `${p.name}|${p.rootPath}|${p.summary.length}`).join('\u0000')
+  const sig = list.map((p) => `${p.projectId}|${p.name}|${p.rootPath}|${p.summary.length}|${p.progress.length}|${p.plan.length}|${p.team.length}`).join('\u0000')
   if (sig === syncedProjectSig) return
   syncedProjectSig = sig
   Promise.resolve(window.astral.memorySyncProjects({ projects: list })).catch(() => {
     syncedProjectSig = ''
   })
+  if (window.astral.teamToolboxSave) {
+    Promise.resolve(window.astral.teamToolboxSave({ projects: list })).catch(() => {
+      syncedProjectSig = ''
+    })
+  }
 }
 
 export function syncMemoryProjectsNow () { syncMemoryProjects() }

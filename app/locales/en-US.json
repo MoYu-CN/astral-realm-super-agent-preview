@@ -3,7 +3,7 @@
   "name": "English (US)",
   "nativeName": "English",
   "dir": "ltr",
-  "title": "Astral Realm",
+  "title": "Astral Realm · Super Agent Preview",
   "messages": {
     "设 置": "Settings",
     "新对话": "New chat",
@@ -256,3 +256,4 @@
     "恢复提示": "Restore notification"
   }
 }
+

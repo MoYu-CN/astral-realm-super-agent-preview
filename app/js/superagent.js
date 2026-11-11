@@ -15,16 +15,72 @@ import {
   state, bus, h, md, avatarNode, persist, toast, commander, pickAvatar, uid,
   superChatActive, activeProject
 } from './core.js'
-import { openModal, field } from './modal.js'
+import { openModal, field, closeModal } from './modal.js'
 import { callModel } from './llm.js'
 import { isGuest } from './roles.js'
 import { setView } from './viewswitch.js'
+import { openMemoryArchive } from './memory-ui.js'
 import {
-  formatRecalledEvents, hideExchange, modelHistory, normalizeMemory, timeRangeForQuery
+  formatRecalledDigests, formatRecalledEvents, hideExchange, modelHistory, normalizeMemory, timeRangeForQuery
 } from './super-memory.js'
 
 const MAX_MESSAGES = 120
 let sending = false
+
+/* 超级智能体直连会话的本地工具：消息接入开后，模型可以主动取摘要/线程/统计。
+   原文仍留在收件箱，不因为一次查询把整段聊天搬进上下文。 */
+const SUPER_INBOX_TOOL = {
+  type: 'function',
+  function: {
+    name: 'memory_inbox',
+    description: '读取消息接入的收件箱。用户打开渠道后，用它确认外面有没有人找、有哪些提醒、哪个群最热；默认只返回摘要/线程，不批量拉原文。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['recent', 'threads', 'stats'] },
+        route: { type: 'string', enum: ['alert', 'observe', 'knowledge', 'archive'] },
+        limit: { type: 'number' }
+      },
+      additionalProperties: false
+    }
+  }
+}
+
+async function runSuperInboxTool (call) {
+  const name = call && call.function && call.function.name
+  if (name !== 'memory_inbox') return { ok: false, text: '这个工具不可用：' + (name || '未命名') }
+  let args = {}
+  try { args = JSON.parse((call.function && call.function.arguments) || '{}') } catch { args = {} }
+  try {
+    if (args.action === 'stats') {
+      const res = await window.astral.intakeStats()
+      return { ok: Boolean(res && res.ok), text: JSON.stringify(res || { ok: false }) }
+    }
+    if (args.action === 'threads') {
+      const res = await window.astral.intakeThreads({ limit: Math.max(1, Math.min(Number(args.limit) || 8, 20)) })
+      return { ok: Boolean(res && res.ok), text: JSON.stringify(res || { ok: false }) }
+    }
+    const res = await window.astral.intakeMessages({
+      route: args.route || undefined,
+      limit: Math.max(1, Math.min(Number(args.limit) || 8, 20))
+    })
+    const messages = Array.isArray(res && res.messages) ? res.messages : []
+    const compact = messages.map((message) => ({
+      id: message.id,
+      at: message.at,
+      route: message.route,
+      sender: message.sender_name || message.sender || '',
+      chat: message.chat_name || message.chat || '',
+      text: String(message.text || '').replace(/\s+/g, ' ').slice(0, 240)
+    }))
+    return {
+      ok: Boolean(res && res.ok),
+      text: JSON.stringify({ ok: Boolean(res && res.ok), messages: compact, error: res && res.error })
+    }
+  } catch (err) {
+    return { ok: false, text: '读取消息接入失败：' + (err.message || err) }
+  }
+}
 
 const EVENT_SYSTEM = [
   '你是事件记录员，不是聊天助手。把这一轮用户与超级智能体的交流整理成一条可以入库的事件精华。',
@@ -122,7 +178,9 @@ function systemPrompt (recalled = '') {
 
   parts.push([
     '## 这条会话的边界',
-    '- 这是用户与你的直连会话：不经过任务派发、不经过监听、不进入项目会话历史。',
+    '- 这是用户与你的直连会话：不经过任务派发、你与用户的对话本身不被监听、不进入项目会话历史。',
+    '- 外部消息（微信 / 企业微信 / QQ / 通知转发）不在这条会话里：它们走收件箱，你用 memory_inbox 主动取。',
+    '- 只有常驻上下文出现「消息接入（实时）」才代表监听已开启；用 memory_inbox 取摘要/线程。没有该块就不要声称自己在听，也不要编造已收到的消息。',
     '- 你可以回答问题、给判断、提建议；但不要假装已经派发了任务、已经读过文件或已经执行了命令。',
     '- 需要执行时，明确说明「这一步要交给执行层」以及需要什么授权，不要用文字代替真实动作。',
     '- 不确定就说不确定；不编造事件编号、记录内容或执行结果。'
@@ -284,6 +342,7 @@ async function saveMessageRecord (msg) {
       text: msg.text || '',
       meta: { kind: msg.kind, agentId: msg.agentId || '' }
     })
+    if (res && res.ok && res.data && res.data.code) msg.code = res.data.code
     return Boolean(res && res.ok)
   } catch (err) {
     console.warn('[super memory] 原文入库失败：', err && err.message ? err.message : err)
@@ -307,6 +366,7 @@ async function writeEssenceEvent (ask, reply, essence) {
       trigger: '用户',
       triggerType: '对话',
       messageIds: [ask.id, reply.id],
+      messageCodes: [ask.code, reply.code].filter(Boolean),
       weight: essence.weight,
       factors: essence.factors
     }
@@ -324,16 +384,23 @@ async function writeEssenceEvent (ask, reply, essence) {
   }
   try {
     if (window.astral.messageDigest) {
-      await window.astral.messageDigest({
+      const res = await window.astral.messageDigest({
+        code: ask.code || undefined,
         messageId: ask.id,
         conversationId: ask.thread || 'super',
         projectId: project ? project.id : null,
         digest: essence.text,
+        oneLine: essence.text,
+        timeText: new Date(ask.ts).toISOString(),
+        createdAt: new Date(ask.ts).toISOString(),
         weight: essence.weight,
+        dynamicWeight: essence.weight,
+        dimensions: essence.factors,
         weightJson: essence.factors,
         scorer: essence.scorer || 'main',
-        metadata: { replyId: reply.id, eventCode: code, trigger: '用户', triggerType: '对话' }
+        metadata: { replyId: reply.id, replyCode: reply.code || '', eventCode: code, trigger: '用户', triggerType: '对话' }
       })
+      if (res && res.ok && res.data && res.data.code) ask.code = res.data.code
     }
   } catch (err) {
     console.warn('[super memory] 浓缩记忆入库失败：', err && err.message ? err.message : err)
@@ -403,16 +470,29 @@ async function recallForMessage (text) {
   }
 
   const block = formatRecalledEvents(events, projects, range)
-  if (!block) return ''
+  let digestBlock = ''
+  try {
+    if (window.astral.messageDigests) {
+      const digests = await window.astral.messageDigests({
+        conversationId: 'super',
+        from: range ? range.from : undefined,
+        to: range ? range.to : undefined,
+        limit: 6
+      })
+      if (digests && digests.ok) digestBlock = formatRecalledDigests(digests.data)
+    }
+  } catch { /* 索引不可用时只用事件召回 */ }
+  if (!block && !digestBlock) return ''
   if (!range && projects.length > 1) {
     return [
       block,
+      digestBlock,
       '',
       '## 记忆歧义',
       '以上命中多个项目。如果用户没有明确项目，先询问是哪个项目，不要自行猜测。'
-    ].join('\n')
+    ].filter(Boolean).join('\n')
   }
-  return block
+  return [block, digestBlock].filter(Boolean).join('\n\n')
 }
 
 export async function superSend (rawText) {
@@ -468,18 +548,37 @@ export async function superSend (rawText) {
   sending = true
   let essence = null
   try {
-    const finalText = await callModel(agent, [
+    let messages = [
       { role: 'system', content: systemPrompt(recalled) },
       ...history,
       { role: 'user', content: text }
-    ], {
-      channel: 'user',
-      onDelta: (chunk) => {
-        if (reply.text === '（正在思考…）') reply.text = ''
-        reply.text += chunk
-        bus.emit('message:update', { id: reply.id })
+    ]
+    let finalText = ''
+    for (let round = 0; round < 3; round++) {
+      const pendingCalls = []
+      finalText = await callModel(agent, messages, {
+        channel: 'user',
+        tools: [SUPER_INBOX_TOOL],
+        onToolCalls: (calls) => pendingCalls.push(...calls),
+        onDelta: (chunk) => {
+          if (reply.text === '（正在思考…）') reply.text = ''
+          reply.text += chunk
+          bus.emit('message:update', { id: reply.id })
+        }
+      })
+      if (!pendingCalls.length) break
+      messages = [...messages, {
+        role: 'assistant',
+        content: finalText || '',
+        tool_calls: pendingCalls
+      }]
+      for (const call of pendingCalls.slice(0, 4)) {
+        const result = await runSuperInboxTool(call)
+        const content = String(result.text || '').slice(0, 8000)
+        messages.push({ role: 'tool', tool_call_id: call.id || '', content })
+        bus.emit('status', result.ok ? '已读取消息接入' : '消息接入读取失败')
       }
-    })
+    }
     if (!reply.text) reply.text = String(finalText || '')
     if (!reply.text) reply.text = '（模型没有返回内容）'
     await saveMessageRecord(reply)
@@ -504,6 +603,104 @@ export async function superSend (rawText) {
 }
 
 /* ------------------------------------------------------------- 资料编辑 */
+
+export function openSuperMemoryIndex () {
+  openModal({
+    title: '记忆索引',
+    sub: 'SUPER AGENT · MESSAGES',
+    width: 720,
+    render: (body) => {
+      const list = h('div', { class: 'memory-index-list' })
+      const hint = h('div', { class: 'hint', text: '加载中…' })
+      body.append(hint, list)
+      ;(async () => {
+        try {
+          const res = await window.astral.messageDigests({ limit: 40 })
+          if (!res || !res.ok) throw new Error((res && res.error) || '读取失败')
+          const rows = Array.isArray(res.data) ? res.data : []
+          hint.textContent = rows.length
+            ? `共 ${rows.length} 条浓缩记忆；点编号可回查完整原文。`
+            : '还没有浓缩索引。'
+          list.textContent = ''
+          for (const row of rows) {
+            const button = h('button', {
+              class: 'memory-index-row',
+              type: 'button',
+              title: '按编号回查完整原文',
+              onclick: async () => {
+                try {
+                  const original = await window.astral.messageGet({ code: row.code })
+                  const text = original && original.ok && original.data ? original.data.text : ''
+                  const input = document.querySelector('#input')
+                  if (!input || !text) { toast('原文不可用', 'err'); return }
+                  input.value = [String(input.value || '').trim(), `【引用原文 · ${row.code}】\n${text}`].filter(Boolean).join('\n\n')
+                  input.focus()
+                  toast(`已按 ${row.code} 引用原文`, 'ok')
+                } catch (err) { toast(err.message || '回查失败', 'err') }
+              }
+            },
+            h('span', { class: 'memory-index-code', text: row.code || '—' }),
+            h('span', { class: 'memory-index-time', text: String(row.time_text || row.created_at || '').replace('T', ' ').slice(0, 16) }),
+            h('span', { class: 'memory-index-text', text: row.one_line || row.digest || '' }),
+            h('span', { class: 'memory-index-weight', text: typeof row.total_weight === 'number' ? row.total_weight.toFixed(2) : '—' })
+            )
+            list.append(button)
+          }
+        } catch (err) {
+          hint.textContent = '读取失败：' + (err.message || err)
+        }
+      })()
+    }
+  })
+}
+
+/* 超级智能体把任务详情交给当前项目的主智能体，由主智能体自己写计划书。 */
+export function openSuperPlanDispatch () {
+  const project = activeProject()
+  if (!project) { toast('先选择一个项目', 'err'); return }
+  const lastTask = [...(state.superChat.messages || [])].reverse().find((msg) => msg.kind === 'user')
+  const taskArea = h('textarea', {
+    class: 'input',
+    rows: 8,
+    placeholder: '写清目标、约束、验收标准；会作为任务详情交给项目主智能体',
+  }, lastTask ? lastTask.text : '')
+  const run = h('button', {
+    class: 'btn-primary',
+    type: 'button',
+    onclick: async () => {
+      run.disabled = true
+      run.textContent = '主智能体编写中…'
+      try {
+        const { generateTeamPlan } = await import('./projects.js')
+        const plan = await generateTeamPlan(project, {
+          name: project.name,
+          rootPath: project.rootPath || '',
+          description: project.description || '',
+          progress: project.progress || '',
+          plan: project.plan || '',
+          taskBrief: taskArea.value
+        })
+        if (plan) closeModal()
+      } finally {
+        run.disabled = false
+        run.textContent = '交给主智能体写计划书'
+      }
+    }
+  }, '交给主智能体写计划书')
+  openModal({
+    title: '下发任务',
+    sub: 'TASK → PROJECT LEAD → PLAN',
+    width: 680,
+    render: (body) => {
+      body.append(
+        h('div', { class: 'hint', text: `目标项目：${project.name}。任务详情交给该项目主智能体，计划书写回团队工具箱。` }),
+        h('div', { style: { marginTop: '12px' } }, field('任务详情', taskArea)),
+        h('div', { class: 'btn-row', style: { marginTop: '14px' } }, run,
+          h('button', { class: 'btn ghost', type: 'button', onclick: closeModal }, '取消'))
+      )
+    }
+  })
+}
 
 export function openSuperProfile () {
   const profile = superProfile()
@@ -596,7 +793,17 @@ export function openSuperProfile () {
               if (!res || res.ok === false) toast('打开失败：' + ((res && res.error) || '未知错误'), 'err')
             }
           }, '编辑硬性上下文'),
-          h('span', { class: 'hint', text: '身份、规则、用户画像与默认授权四块；保存后下一轮生效。' })
+          h('button', {
+            class: 'btn ghost',
+            type: 'button',
+            onclick: () => openMemoryArchive()
+          }, '记忆索引'),
+          h('button', {
+            class: 'btn ghost',
+            type: 'button',
+            onclick: () => openSuperPlanDispatch()
+          }, '下发任务'),
+          h('span', { class: 'hint', text: '身份、规则、用户画像与默认授权四块；记忆索引可按编号回查原文。' })
         )
       )
     }

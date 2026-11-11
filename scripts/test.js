@@ -957,6 +957,28 @@ test('超级会话：用户保留完整记录，模型只读取未隐藏消息�
   const range = mod.timeRangeForQuery('昨天那个项目到哪了', new Date(2026, 10, 11, 12, 0, 0).getTime())
   assert.equal(range.label, '昨天')
   assert.ok(new Date(range.from) < new Date(range.to))
+  const three = mod.timeRangeForQuery('前三天做了什么', new Date(2026, 0, 1, 12, 0, 0).getTime())
+  assert.equal(new Date(three.from).getDate(), 28)
+  assert.equal(new Date(three.from).getMonth(), 11, '1 月 1 日的前三天应从 12 月 28 日起算')
+  const exact = mod.timeRangeForQuery('2026-01-01 做了什么', new Date(2026, 0, 5, 12, 0, 0).getTime())
+  assert.equal(new Date(exact.from).getDate(), 1)
+  assert.equal(new Date(exact.from).getMonth(), 0)
+  const weekday = mod.timeRangeForQuery('上周三做了什么', new Date(2026, 0, 5, 12, 0, 0).getTime())
+  assert.equal(new Date(weekday.from).getDate(), 31, '上周三应落到 12 月 31 日')
+  const span = mod.timeRangeForQuery('1月1日到1月5日做了什么', new Date(2026, 0, 10, 12, 0, 0).getTime())
+  assert.equal(new Date(span.from).getDate(), 1)
+  assert.equal(new Date(span.to).getDate(), 6)
+  const point = mod.timeRangeForQuery('今天下午3点做了什么', new Date(2026, 0, 5, 12, 0, 0).getTime())
+  assert.equal(new Date(point.from).getHours(), 15)
+  assert.equal(new Date(point.to).getHours(), 16)
+  const monthSpan = mod.timeRangeForQuery('最近三个月做了什么', new Date(2026, 4, 15, 12, 0, 0).getTime())
+  assert.equal(new Date(monthSpan.from).getMonth(), 1)
+  const weekSpan = mod.timeRangeForQuery('前两周做了什么', new Date(2026, 0, 7, 12, 0, 0).getTime())
+  assert.equal(new Date(weekSpan.from).getDate(), 22, '前两周应从 12 月 22 日起算')
+  const lastQuarter = mod.timeRangeForQuery('上季度做了什么', new Date(2026, 4, 15, 12, 0, 0).getTime())
+  assert.equal(new Date(lastQuarter.from).getMonth(), 0)
+  const cnDay = mod.timeRangeForQuery('1月1号做了什么', new Date(2026, 0, 10, 12, 0, 0).getTime())
+  assert.equal(new Date(cnDay.from).getDate(), 1)
   const recalled = mod.formatRecalledEvents([
     { project: '示例项目', summary: '完成登录修复', result: '完成', startedAt: range.from }
   ], [], range)
@@ -1008,9 +1030,57 @@ test('消息原文只追加、浓缩记忆链接原文，权重可由打分方�
       assert.equal(digest.ok, true)
       assert.equal(digest.data.message_id, 'm1')
       assert.equal(digest.data.weight, 0.62)
+      assert.match(first.data.code, /^M\d{6}$/)
+      assert.equal(digest.data.code, first.data.code)
+      const byCode = service.getMessageRecord({ actor: ROLE.SUPER, code: first.data.code })
+      assert.equal(byCode.data.text, '完整原文一', '右键编号必须能回查原文')
       const list = service.queryMessageDigests({ actor: ROLE.SUPER, conversationId: 'c1' })
       assert.equal(list.data.length, 1)
       assert.equal(list.data[0].digest, '浓缩版本')
+      assert.equal(typeof list.data[0].time_weight, 'number')
+      assert.equal(list.data[0].total_weight, 0.62)
+
+      service.writeMessageRecord({
+        actor: ROLE.SUPER, id: 'm2', conversationId: 'c1', role: 'assistant', text: '完整原文二'
+      })
+      const digest2 = service.writeMessageDigest({
+        actor: ROLE.SUPER, messageId: 'm2', conversationId: 'c1', digest: '浓缩版本二',
+        weight: 0.4, dimensions: { usage: 2, trigger: '用户' }, scorer: 'main'
+      })
+      assert.equal(digest2.ok, true)
+      assert.ok(digest2.data.relation_weight > 0, '相同会话的浓缩内容应产生关联权重')
+      const adjusted = service.adjustMessageWeight({
+        actor: ROLE.SUPER, code: digest2.data.code, dynamicWeight: 0.91,
+        dimensions: { usage: 3 }, scorer: 'main'
+      })
+      assert.equal(adjusted.data.dynamic_weight, 0.91)
+      assert.equal(adjusted.data.total_weight, 0.91)
+      const edges = service.weightEdges({ actor: ROLE.SUPER, code: digest2.data.code })
+      assert.equal(edges.ok, true)
+      assert.ok(edges.data.length >= 1, '同会话事件应建立动态关联边')
+      const graph = service.messageGraph({ actor: ROLE.SUPER })
+      assert.equal(graph.ok, true)
+      assert.equal(graph.data.nodes.length, 2)
+      assert.ok(graph.data.edges.length >= 1)
+      const dims = service.weightDimensions({ actor: ROLE.SUPER })
+      assert.equal(dims.ok, true)
+      assert.ok(dims.data.some((item) => item.name === 'usage'), '模型新增的维度应自动登记')
+
+      service.writeTeamToolbox({
+        actor: ROLE.SUPER,
+        projects: [{
+          projectId: 'p1', name: '示例项目', rootPath: 'C:\\示例', progress: '测试中',
+          plan: '第一步：接手；第二步：验证', taskBrief: '接管说明',
+          team: [{ id: 'a1' }], knowledge: ['k1'], decisions: ['d1']
+        }]
+      })
+      const box = service.getTeamToolbox({ actor: ROLE.SUPER, projectId: 'p1' })
+      assert.equal(box.data.name, '示例项目')
+      assert.equal(box.data.progress, '测试中')
+      assert.match(box.data.plan, /接手/)
+      const found = service.findTeamToolbox({ actor: ROLE.SUPER, rootPath: 'C:\\示例' })
+      assert.equal(found.ok, true)
+      assert.equal(found.data.project_id, 'p1')
     } finally { service.close() }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })

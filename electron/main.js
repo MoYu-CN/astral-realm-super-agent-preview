@@ -193,7 +193,17 @@ const intake = createIntake({
       return service.inbox(input)
     }
   },
-  log: (line) => { if (process.env.ASTRAL_DEBUG) console.log('[intake]', line) }
+  log: (line) => { if (process.env.ASTRAL_DEBUG) console.log('[intake]', line) },
+  /* 新消息落库就通知窗口：常驻上下文里的「消息接入」要立刻跟着变，
+     不然 AI 要等到下次切窗口才知道有人在叫它。 */
+  onIngest: (payload) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    mainWindow.webContents.send('astral:intake:new', {
+      channelId: payload.channelId,
+      inserted: payload.inserted || 0,
+      alerts: payload.alerts || 0
+    })
+  }
 })
 
 const { createMcpRegistry } = require('./mcp-client.js')
@@ -1293,6 +1303,7 @@ async function flushMessageFallback () {
     try {
       if (row.kind === 'record') result = memoryHost.messageRecord(row.payload || {})
       else if (row.kind === 'digest') result = memoryHost.messageDigest(row.payload || {})
+      else if (row.kind === 'weight') result = memoryHost.messageWeight(row.payload || {})
       else result = { ok: true }
     } catch (err) {
       result = { ok: false, error: err.message }
@@ -1355,6 +1366,51 @@ ipcMain.handle('astral:message:digests', async (_event, payload = {}) => {
       (!conversationId || row.payload.conversationId === conversationId))
     .map((row) => row.payload)
   return { ok: true, data, fallback: true }
+})
+
+ipcMain.handle('astral:message:weight', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  const result = memoryHost.messageWeight(payload || {})
+  if (result && result.ok) {
+    flushMessageFallback().catch(() => {})
+    return result
+  }
+  try {
+    await appendMessageFallback('weight', payload || {})
+    return { ok: true, pending: true, fallback: true }
+  } catch (err) {
+    return { ok: false, error: (result && result.error) || err.message }
+  }
+})
+
+ipcMain.handle('astral:message:edges', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  return memoryHost.messageEdges(payload || {})
+})
+
+ipcMain.handle('astral:message:dimensions', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  return memoryHost.messageDimensions(payload || {})
+})
+
+ipcMain.handle('astral:message:graph', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  return memoryHost.messageGraph(payload || {})
+})
+
+ipcMain.handle('astral:team:toolbox:save', async (_event, payload = {}) => {
+  if (!roleCan('memory.write')) return deny('memory.write')
+  return memoryHost.teamToolboxSave(payload || {})
+})
+
+ipcMain.handle('astral:team:toolbox:get', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  return memoryHost.teamToolboxGet(payload || {})
+})
+
+ipcMain.handle('astral:team:toolbox:find', async (_event, payload = {}) => {
+  if (!roleCan('memory.read')) return deny('memory.read')
+  return memoryHost.teamToolboxFind(payload || {})
 })
 /* 项目镜像：把左侧项目列表同步成权重网节点，元数据级写入，不涉及正文 */
 ipcMain.handle('astral:memory:syncProjects', async (_event, payload = {}) => {
@@ -3392,7 +3448,7 @@ function createWindow (savedState) {
     thickFrame: true,
     backgroundColor: '#05060d',
     autoHideMenuBar: true,
-    title: '星界',
+    title: '星界 · 超级智能体试运行',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

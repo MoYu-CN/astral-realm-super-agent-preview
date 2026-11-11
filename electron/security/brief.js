@@ -41,6 +41,8 @@ function lines (db) {
     return { text: '', stats }
   }
 
+  /* 「没有等你决定的外发」这种否定句一行都不该占：它不带来任何信息，
+     却每一轮都付一次成本。没闸门就干脆不写这一行。 */
   if (stats.pending) {
     let gates = []
     try {
@@ -52,8 +54,6 @@ function lines (db) {
     } catch { gates = [] }
     out.push(`- 待你点头 ${stats.pending} 件：` +
       gates.map((gate) => `${RISK[gate.risk] || '敏感'}·${clip(gate.target, 18) || '外部'}`).join('；'))
-  } else {
-    out.push('- 没有等你决定的外发')
   }
 
   if (stats.open) {

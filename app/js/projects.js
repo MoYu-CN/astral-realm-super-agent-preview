@@ -11,8 +11,37 @@ import { icon } from './icons.js'
 import { instantiateTemplate, templateSummary } from './team-templates.js'
 import { leaveSuperChat } from './superagent.js'
 import { openScout } from './scout.js'
+import { buildMessages, callModel } from './llm.js'
 
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/
+
+/* 进入/切换项目时自动读取团队工具箱与项目浓缩索引；失败不阻塞项目加载。 */
+async function loadTeamToolbox (projectId) {
+  state.teamToolbox = null
+  state.projectDigests = []
+  if (!projectId || !window.astral) return null
+  let box = null
+  if (typeof window.astral.teamToolboxGet === 'function') {
+    try {
+      const res = await window.astral.teamToolboxGet({ projectId })
+      if (res && res.ok && res.data) {
+        box = res.data
+        state.teamToolbox = box
+        bus.emit('team:toolbox', box)
+      }
+    } catch { /* 工具箱读取失败时按无工具箱继续 */ }
+  }
+  if (typeof window.astral.messageDigests === 'function') {
+    try {
+      const res = await window.astral.messageDigests({ projectId, limit: 24 })
+      if (res && res.ok && Array.isArray(res.data)) {
+        state.projectDigests = res.data
+        bus.emit('project:digests', res.data)
+      }
+    } catch { /* 索引读取失败时不影响项目 */ }
+  }
+  return box
+}
 
 function safeId (id) {
   return typeof id === 'string' && ID_RE.test(id) ? id : uid('project')
@@ -41,6 +70,10 @@ function normalizeProject (project) {  const p = project && typeof project === '
     name: String(p.name || '未命名会话').trim() || '未命名会话',
     rootPath: typeof p.rootPath === 'string' ? p.rootPath : '',
     description: typeof p.description === 'string' ? p.description : '',
+    progress: typeof p.progress === 'string' ? p.progress : '',
+    plan: typeof p.plan === 'string' ? p.plan : '',
+    taskBrief: typeof p.taskBrief === 'string' ? p.taskBrief : '',
+    takeoverFrom: typeof p.takeoverFrom === 'string' ? p.takeoverFrom : '',
     createdAt: Number(p.createdAt) || Date.now(),
     updatedAt: Number(p.updatedAt) || Date.now(),
     teamTemplateId: typeof p.teamTemplateId === 'string' ? p.teamTemplateId : '',
@@ -106,6 +139,7 @@ async function migrateLegacy (data) {
     saveProjectsNow(),
     saveProjectSessionNow(project.id)
   ])
+  await loadTeamToolbox(project.id)
 }
 
 export async function initProjects (data) {
@@ -150,6 +184,7 @@ export async function initProjects (data) {
   }
 
   if (!wanted || wanted.id !== state.activeProjectId) await saveProjectsNow()
+  await loadTeamToolbox(active.id)
   return active
 }
 
@@ -200,6 +235,7 @@ export async function switchProject (id) {
     state.tasks = []
     syncActiveProject()
     await saveProjectsNow()
+    await loadTeamToolbox(target.id)
 
     bus.emit('project:changed', target)
     bus.emit('roster:changed')
@@ -212,7 +248,7 @@ export async function switchProject (id) {
 
 /* ------------------------------------------------------------ 新增项目 */
 
-export async function createProject ({ name, rootPath = '', description = '', templateId = '', roster = null, workMode = '', conversationMode = '', autoName = false, archivedAt = 0, silent = false }) {
+export async function createProject ({ name, rootPath = '', description = '', templateId = '', roster = null, workMode = '', conversationMode = '', autoName = false, archivedAt = 0, silent = false, plan = '', taskBrief = '', takeoverFrom = '', progress = '' }) {
   if (state.busy || switching) {
     toast('协作进行中，暂时不能新建项目', 'err')
     return null
@@ -235,11 +271,26 @@ export async function createProject ({ name, rootPath = '', description = '', te
   const convMode = conversationMode === 'plugin'
     ? 'plugin'
     : (conversationMode === 'solo' || conversationMode === 'team' ? conversationMode : mode)
+  /* 同目录已有工具箱时自动接管：把计划书、进度和任务详情带进新团队。 */
+  let inherited = null
+  if (rootPath && window.astral && typeof window.astral.teamToolboxFind === 'function') {
+    try {
+      const found = await window.astral.teamToolboxFind({ rootPath: String(rootPath).trim() })
+      if (found && found.ok && found.data) inherited = found.data
+    } catch { /* 没有旧工具箱就按新项目处理 */ }
+  }
+  const inheritedTask = inherited && inherited.task_json
+    ? (() => { try { const t = JSON.parse(inherited.task_json); return typeof t === 'string' ? t : JSON.stringify(t) } catch { return '' } })()
+    : ''
   const project = normalizeProject({
     id: uid('project'),
     name: title,
     rootPath: String(rootPath || '').trim(),
     description: String(description || '').trim(),
+    progress: inherited ? (inherited.progress || '') : String(progress || ''),
+    plan: String(plan || (inherited && inherited.plan) || ''),
+    taskBrief: String(taskBrief || inheritedTask || ''),
+    takeoverFrom: String(takeoverFrom || (inherited && inherited.project_id) || ''),
     createdAt: Date.now(),
     updatedAt: Date.now(),
     teamTemplateId: template ? template.id : '',
@@ -405,8 +456,13 @@ export async function updateProject (id, patch = {}) {  const project = state.pr
   if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim()
   if (typeof patch.rootPath === 'string') project.rootPath = patch.rootPath.trim()
   if (typeof patch.description === 'string') project.description = patch.description.trim()
+  if (typeof patch.progress === 'string') project.progress = patch.progress.trim()
+  if (typeof patch.plan === 'string') project.plan = patch.plan
+  if (typeof patch.taskBrief === 'string') project.taskBrief = patch.taskBrief
+  if (typeof patch.takeoverFrom === 'string') project.takeoverFrom = patch.takeoverFrom.trim()
   project.updatedAt = Date.now()
   await saveProjectsNow()
+  await loadTeamToolbox(project.id)
   bus.emit('projects:changed', project)
   return true
 }
@@ -528,11 +584,57 @@ export function renderProjectTree () {
 
 /* ---------------------------------------------------------- 新增/编辑弹层 */
 
+/* 主智能体根据超级智能体/用户给的任务详情自己写计划书，写回项目与工具箱。 */
+export async function generateTeamPlan (project, draft, onText) {
+  if (!project || project.id !== state.activeProjectId) {
+    toast('先切换到该项目，再让它的主智能体写计划书', 'err')
+    return ''
+  }
+  const agents = (project.roster && project.roster.agents) || []
+  const lead = agents.find((a) => a.enabled !== false && a.role === 'commander') ||
+    agents.find((a) => a.enabled !== false && a.role === 'deputy') ||
+    agents.find((a) => a.enabled !== false)
+  if (!lead) {
+    toast('这个项目还没有可用的主智能体', 'err')
+    return ''
+  }
+  const task = String(draft.taskBrief || '').trim() || String(draft.description || '').trim() || '按项目当前进度继续推进'
+  const prompt = [
+    '你是本项目的主智能体。请根据下面的任务详情，自己写一份可执行的团队计划书。',
+    `项目：${draft.name || project.name}`,
+    `任务详情：${task}`,
+    `当前进度：${draft.progress || '未填写'}`,
+    '计划书必须包含：目标、阶段拆分、各成员分工、交付物、验收标准、风险与回退方案。',
+    '只输出计划书正文，不要解释你在写计划，不要输出 Markdown 代码围栏。'
+  ].join('\n')
+  try {
+    const messages = buildMessages(lead, prompt, [], { channel: 'user' })
+    const text = await callModel(lead, messages, { channel: 'user' })
+    const plan = String(text || '').trim()
+    if (!plan) throw new Error('模型没有返回计划书')
+    draft.plan = plan
+    if (onText) onText(plan)
+    await updateProject(project.id, { plan, taskBrief: String(draft.taskBrief || ''), progress: String(draft.progress || '') })
+    toast(`计划书已由 ${lead.name} 写回项目工具箱`, 'ok')
+    return plan
+  } catch (err) {
+    toast('计划书生成失败：' + (err.message || err), 'err')
+    return ''
+  }
+}
+
 export function openProjectDialog (project = null) {
   const editing = Boolean(project)
   const draft = editing
-    ? { name: project.name, rootPath: project.rootPath || '', description: project.description || '' }
-    : { name: '', rootPath: '', description: '' }
+    ? {
+        name: project.name,
+        rootPath: project.rootPath || '',
+        description: project.description || '',
+        progress: project.progress || '',
+        plan: project.plan || '',
+        taskBrief: project.taskBrief || ''
+      }
+    : { name: '', rootPath: '', description: '', progress: '', plan: '', taskBrief: '' }
 
   let templateId = ''
   if (editing) templateId = project.teamTemplateId || ''
@@ -564,6 +666,31 @@ export function openProjectDialog (project = null) {
         }
       }, '选择文件夹')
 
+      const planArea = h('textarea', {
+        class: 'input',
+        rows: 8,
+        placeholder: '超级智能体下发的任务详情，或本项目主智能体自己写的计划书',
+        oninput: (e) => { draft.plan = e.target.value }
+      }, draft.plan || '')
+      const planBtn = h('button', {
+        class: 'btn ghost',
+        type: 'button',
+        onclick: async () => {
+          if (!editing) { toast('先创建项目，再让主智能体写计划书', 'err'); return }
+          planBtn.disabled = true
+          planBtn.textContent = '生成中…'
+          try {
+            await generateTeamPlan(project, draft, (text) => {
+              draft.plan = text
+              planArea.value = text
+            })
+          } finally {
+            planBtn.disabled = false
+            planBtn.textContent = '主智能体写计划书'
+          }
+        }
+      }, '主智能体写计划书')
+
       const rows = [
         field('项目名称', h('input', {
           class: 'input',
@@ -578,8 +705,25 @@ export function openProjectDialog (project = null) {
           value: draft.description,
           placeholder: '一句话说明这个项目',
           oninput: (e) => { draft.description = e.target.value }
-        }))
+        })),
+        field('当前进度', h('textarea', {
+          class: 'input',
+          rows: 2,
+          placeholder: '例如：接口已完成，正在做界面联调',
+          oninput: (e) => { draft.progress = e.target.value }
+        }, draft.progress || '')),
+        field('团队计划书', h('div', { class: 'plan-editor' }, planArea, planBtn),
+          '会随团队工具箱自动读取，接管时继续带给新团队；也可以让本项目主智能体按任务详情自己写。'),
+        field('任务详情 / 接管说明', h('textarea', {
+          class: 'input',
+          rows: 4,
+          placeholder: '任务背景、验收标准、上一团队留下的注意事项',
+          oninput: (e) => { draft.taskBrief = e.target.value }
+        }, draft.taskBrief || ''))
       ]
+      if (editing && project.takeoverFrom) {
+        rows.push(h('div', { class: 'hint', text: `这支团队接管自项目 ${project.takeoverFrom}；进度与计划书已继承。` }))
+      }
 
       if (!editing) {
         const templates = state.teamTemplates || []

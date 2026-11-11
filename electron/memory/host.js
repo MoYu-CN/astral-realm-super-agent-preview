@@ -106,7 +106,7 @@ function createMemoryHost ({ configDir, viewServerPath, port = DEFAULT_PORT, log
         const names = [
           'projects', 'events', 'proposals', 'dispatch_log', 'behavior_log',
           'knowledge', 'event_prefixes', 'diary_digest', 'archive_manifest',
-          'kb_nodes', 'kb_links', 'message_records', 'message_digests'
+          'kb_nodes', 'kb_links', 'message_records', 'message_digests', 'weight_dimensions', 'team_toolboxes'
         ]
         tables = names.map((name) => ({
           name,
@@ -168,6 +168,20 @@ function createMemoryHost ({ configDir, viewServerPath, port = DEFAULT_PORT, log
       if (action === 'threads') return s.inbox({ action: 'threads', limit: args.limit || 20 })
       if (action === 'stats') return s.inbox({ action: 'stats' })
       if (action === 'handled') return s.inbox({ action: 'handled', ids: args.ids || [] })
+      /* 首流同款摘要：让 AI 一眼知道「我在听什么」，不必先拉一整页消息 */
+      if (action === 'brief') return s.inbox({ action: 'brief' })
+      if (action === 'channels') {
+        const res = s.inbox({ action: 'channels' })
+        if (!res.ok) return res
+        /* 渠道配置里可能有路径、URL，工具层只回「哪条、开没开、跑到哪」 */
+        return {
+          ok: true,
+          data: (res.data || []).map((c) => ({
+            id: c.id, kind: c.kind, label: c.label, enabled: Boolean(c.enabled),
+            status: c.status || '', lastAt: c.lastAt || '', error: c.lastError || ''
+          }))
+        }
+      }
       return { ok: false, error: '未知的收件箱动作：' + action }
     }
 
@@ -327,6 +341,55 @@ function createMemoryHost ({ configDir, viewServerPath, port = DEFAULT_PORT, log
     return s.queryMessageDigests({ ...input, actor: ROLE.SUPER })
   }
 
+  function messageWeight (input = {}) {
+    if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
+    const s = ensureService()
+    if (!s) return { ok: false, error: '记忆服务已关闭' }
+    return s.adjustMessageWeight({ ...input, actor: ROLE.SUPER })
+  }
+
+  function messageEdges (input = {}) {
+    if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
+    const s = ensureService()
+    if (!s) return { ok: false, error: '记忆服务已关闭' }
+    return s.weightEdges({ ...input, actor: ROLE.SUPER })
+  }
+
+  function messageDimensions (input = {}) {
+    if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
+    const s = ensureService()
+    if (!s) return { ok: false, error: '记忆服务已关闭' }
+    return s.weightDimensions({ ...input, actor: ROLE.SUPER })
+  }
+
+  function messageGraph (input = {}) {
+    if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
+    const s = ensureService()
+    if (!s) return { ok: false, error: '记忆服务已关闭' }
+    return s.messageGraph({ ...input, actor: ROLE.SUPER })
+  }
+
+  function teamToolboxSave (input = {}) {
+    if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
+    const s = ensureService()
+    if (!s) return { ok: false, error: '记忆服务已关闭' }
+    return s.writeTeamToolbox({ ...input, actor: ROLE.SUPER })
+  }
+
+  function teamToolboxGet (input = {}) {
+    if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
+    const s = ensureService()
+    if (!s) return { ok: false, error: '记忆服务已关闭' }
+    return s.getTeamToolbox({ ...input, actor: ROLE.SUPER })
+  }
+
+  function teamToolboxFind (input = {}) {
+    if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
+    const s = ensureService()
+    if (!s) return { ok: false, error: '记忆服务已关闭' }
+    return s.findTeamToolbox({ ...input, actor: ROLE.SUPER })
+  }
+
   function weightNet () {
     if (!enabled()) return { ok: false, error: '记忆服务已关闭' }
     const s = ensureService()
@@ -453,6 +516,13 @@ function createMemoryHost ({ configDir, viewServerPath, port = DEFAULT_PORT, log
     messageDigest,
     messageGet,
     messageDigests,
+    messageWeight,
+    messageEdges,
+    messageDimensions,
+    messageGraph,
+    teamToolboxSave,
+    teamToolboxGet,
+    teamToolboxFind,
     time,
     kb,
     inbox (input = {}) {

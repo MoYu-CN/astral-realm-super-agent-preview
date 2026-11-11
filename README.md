@@ -1,4 +1,4 @@
-# 星界 · Astral Realm
+# 星界 · Astral Realm · 超级智能体试运行
 
 多 Agent、多模型的协作工作台。你划分编制，它们各司其职。
 
@@ -36,6 +36,28 @@ Read the Chinese introduction below, or switch the app language in **Settings �
 - 每个成员独立绑定模型、独立提示词、独立技能、独立上下文。
 - 用户下达指令 → 总指挥拆解 → 派单给副指挥 / 执行者 → 收齐交付 → 汇总成最终答复。
 - 任何一个成员都可以被单独叫出来直聊（左侧点选，或 `@名字`）。
+
+## 系统结构关系图
+
+![星界系统结构关系图](docs/系统结构关系图.png)
+
+这张图把“谁在做事、数据存在哪、接口怎么流动、边界在哪”画在同一张图上：
+
+- **入口 · 界面**：用户、外部 MCP 客户端、定时/事件/文件进入桌面界面；会话、任务轨迹、记忆档案、右键候选栏、工具箱与设置都在 Renderer。
+- **桥接 · 编排**：`window.astral` 与 IPC 把界面接到主进程；超级智能体是主脑，项目主智能体负责本项目，团队负责执行，工具网关和安全守卫控制外部动作。
+- **接口层**：消息/权重接口、团队/知识/检索接口、安全/输入/MCP 接口分别接到存储；本轮模型只拿到硬性上下文和命中的浓缩索引。
+- **持久层**：`message_records` 存完整原文，`message_digests` 存带编号、时间、一句话和权重的浓缩记忆；`weight_edges` / `weight_dimensions` 记录关联和动态维度；`team_toolboxes` 保存进度、计划书、任务详情和接管来源；其余是事件、时间、知识、安全与输入表。
+- **关系链**：`message_records.id → message_digests.message_id`，`message_digests.code → weight_edges.from/to`，`projects.id → team_toolboxes.project_id`，`events.code → security_tasks.event_code`。
+- **兜底**：数据库不可用时先写 `message-fallback.jsonl`，恢复后迁回。
+
+核心原则：
+
+```text
+原文负责不被篡改
+浓缩索引负责被找到
+权重负责现在带谁回来
+模型上下文不直接搬数据库
+```
 
 ### 界面一览
 

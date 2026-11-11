@@ -40,7 +40,7 @@ function fresh (opts = {}) {
 }
 const EVENT = { action: 'event', project: '投票项目', prefix: 'BB', summary: '修复登录报错' }
 
-test('建库：31 张表齐全（9 张记录表 + 硬性上下文 + 15 张派生表 + 3 张收件箱表 + 3 张安全边界表），knowledge 表无项目外键', () => {
+test('建库：36 张表齐全（含原文/浓缩、权重边、团队工具箱），knowledge 表无项目外键', () => {
   const { store } = fresh()
   try {
     const tables = store.db
@@ -51,10 +51,11 @@ test('建库：31 张表齐全（9 张记录表 + 硬性上下文 + 15 张派生
       'event_links', 'event_prefixes', 'event_terms', 'events',
       'hard_context', 'inbox_channels', 'inbox_messages', 'inbox_threads',
       'kb_hits', 'kb_links', 'kb_nodes', 'kb_terms',
-      'knowledge', 'observations', 'phase_events', 'phase_probs',
+      'knowledge', 'message_digests', 'message_records', 'observations', 'phase_events', 'phase_probs',
       'phase_transitions', 'project_links', 'project_terms',
       'projects', 'proposals', 'recall_log', 'security_gates', 'security_ledger',
-      'security_tasks', 'time_slots', 'week_docs'
+      'security_tasks', 'team_toolboxes', 'time_slots', 'week_docs',
+      'weight_dimensions', 'weight_edges'
     ].sort())
     const sql = store.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'knowledge'").get().sql
     assert.ok(!/project_id/i.test(sql), 'knowledge 表不应出现 project_id')
@@ -293,11 +294,13 @@ test('stdio server 可独立启动并响应 initialize / tools/list / tools/call
   assert.equal(replies.length, 3)
   assert.equal(replies[0].result.serverInfo.name, 'astral-memory')
   assert.equal(replies[0].result.protocolVersion, '2024-11-05')
-  assert.equal(replies[1].result.tools.length, 8, 'stdio 应含 recall / time / observe 三个新工具')
+  assert.equal(replies[1].result.tools.length, 8, 'stdio 应含 recall / time / observe 与原文回查工具')
   const timeTool = replies[1].result.tools.find((t) => t.name === 'memory_time')
   assert.ok(timeTool)
   assert.ok(timeTool.inputSchema.properties.action.enum.includes('phase'))
   assert.ok(timeTool.inputSchema.properties.project, 'phase 需要能指定项目')
+  assert.ok(replies[1].result.tools.some((t) => t.name === 'message_get'), '应能按编号回查原文')
+  assert.ok(!replies[1].result.tools.some((t) => t.name === 'memory_compress'), '不应再暴露摘要压缩工具')
   const payload = JSON.parse(replies[2].result.content[0].text)
   assert.equal(payload.ok, true)
   assert.equal(payload.data.code, 'BB001')
@@ -1016,7 +1019,7 @@ test('时间网升级：v4 的时段表补列后可重建，旧缓存行不残�
   try {
     const cols = store.db.prepare('PRAGMA table_info(time_slots)').all().map((row) => row.name)
     assert.ok(['share', 'reliability', 'weeks'].every((col) => cols.includes(col)), '升级应补齐三列')
-    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 11)
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 15)
     store.write({ actor: ROLE.SUPER, action: 'project', name: '星界', summary: '升级验证' })
     store.write({
       actor: ROLE.SUPER, action: 'event', project: '星界', prefix: 'P', summary: '写一条',
@@ -1466,6 +1469,40 @@ test('接入解析：字段认不出就整条当正文，错令牌被拒', () =>
   assert.equal(verdict.route, 'alert')
   const quiet = normalize.classify({ text: '哈哈哈', scope: 'group', mentionsMe: false })
   assert.equal(quiet.route, 'archive', '群里闲聊一律归档')
+})
+
+test('消息接入：一开渠道就进首流，AI 不必猜也知道自己在听什么', () => {
+  const { store } = fresh()
+  try {
+    /* 没开渠道：一段都不占，省下每一轮的成本 */
+    assert.equal(store.inbox({ action: 'brief' }).data.text, '')
+    assert.ok(!store.hardContext.prompt().data.text.includes('### 消息接入（实时）'))
+
+    store.inbox({ action: 'saveChannel', id: 'w1', kind: 'wecom', label: '企业微信', enabled: true, config: {} })
+    const opened = store.inbox({ action: 'brief' }).data
+    assert.match(opened.text, /已接 1 条渠道：企业微信/)
+    assert.ok(opened.text.length <= 240, '首流这一段必须压得住：' + opened.text.length)
+
+    store.inbox({
+      action: 'ingest',
+      id: 'w1',
+      messages: [{
+        text: '小王，明天下午三点前把方案整理一份发我',
+        chatId: 'g1', chatName: '产品群', senderName: '张经理', mentionsMe: true,
+        at: new Date().toISOString()
+      }]
+    })
+    const brief = store.inbox({ action: 'brief' }).data
+    assert.match(brief.text, /外面有 1 条在等你：张经理/)
+    assert.match(brief.text, /memory_inbox action=recent route=alert/, '要告诉 AI 从哪个动作取全文')
+
+    /* 真进得到常驻上下文，而且排在安全状态前面 */
+    const prompt = store.hardContext.prompt().data.text
+    assert.match(prompt, /### 消息接入（实时）/)
+    const at = prompt.indexOf('### 消息接入（实时）')
+    const sec = prompt.indexOf('### 安全状态（实时）')
+    if (sec >= 0) assert.ok(at < sec, '接入状态在前，安全状态在后')
+  } finally { store.close() }
 })
 
 ;(async () => {

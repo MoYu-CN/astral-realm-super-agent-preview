@@ -9,7 +9,7 @@ import { openModal, closeModal, field } from './modal.js'
 import { confirmAction } from './confirm.js'
 import { enhanceMarkdown } from './rich-markdown.js'
 import { icon } from './icons.js'
-import { saveSuperHistoryNow } from './superagent.js'
+import { saveSuperHistoryNow, enterSuperChat } from './superagent.js'
 import { toggleContextRelease } from './context-release.js'
 import {
   isImageFile, createImageThumb, enhanceMarkdownImages, openImagePreview
@@ -523,20 +523,148 @@ function releaseButton (msg) {
   return btn
 }
 
-/* 完整原文仍留在用户界面，但不进模型上下文。用户需要让智能体看原文时，
-   显式把这段话作为下一条消息的引用发出去，而不是偷偷恢复上下文。 */
-function quoteOriginalForTarget (msg) {
+/* 气泡右键：优先按编号回查数据库原文；数据库不可用时回退当前会话副本。
+   只把原文放进输入框，不改动消息、不自动恢复上下文。 */
+async function quoteOriginalForTarget (msg) {
   const input = document.querySelector('#input')
-  const text = String((msg && msg.text) || '').trim()
-  if (!input || !text) return
-  const block = `【引用原文】\n${text}`
+  if (!input || !msg) return
+  let text = String(msg.text || '').trim()
+  if (msg.code && window.astral && window.astral.messageGet) {
+    try {
+      const res = await window.astral.messageGet({ code: msg.code })
+      if (res && res.ok && res.data && res.data.text) text = String(res.data.text).trim()
+    } catch { /* 回退当前副本 */ }
+  }
+  if (!text) return
+  const block = `【引用原文${msg.code ? ` · ${msg.code}` : ''}】\n${text}`
   input.value = [String(input.value || '').trim(), block].filter(Boolean).join('\n\n')
   input.focus()
-  toast('已引用原文；发送后会交给当前对话', 'ok')
+  toast(msg.code ? `已按 ${msg.code} 引用原文` : '已引用原文；发送后会交给当前对话', 'ok')
+}
+
+let contextMenu = null
+function closeContextMenu () {
+  if (contextMenu) { contextMenu.remove(); contextMenu = null }
+}
+
+async function messageOriginalForMenu (msg) {
+  let text = String((msg && msg.text) || '').trim()
+  if (msg && msg.code && window.astral && window.astral.messageGet) {
+    try {
+      const res = await window.astral.messageGet({ code: msg.code })
+      if (res && res.ok && res.data && res.data.text) text = String(res.data.text).trim()
+    } catch { /* fallback */ }
+  }
+  return text
+}
+
+async function quoteToTarget (msg, target) {
+  const text = await messageOriginalForMenu(msg)
+  if (!text) { toast('没有可引用的原文', 'err'); return }
+  if (target && target.kind === 'super') await enterSuperChat()
+  const input = document.querySelector('#input')
+  if (!input) return
+  const prefix = target && target.kind === 'agent' && target.agent ? `@${target.agent.name}` : ''
+  const header = msg.code ? `【引用原文 · ${msg.code}】` : '【引用原文】'
+  const block = [prefix, header, text].filter(Boolean).join('\n')
+  input.value = [String(input.value || '').trim(), block].filter(Boolean).join('\n\n')
+  input.focus()
+  closeContextMenu()
+  toast(target && target.kind === 'super' ? '已引用给超级智能体' : (target && target.kind === 'agent' ? `已引用给 ${target.agent.name}` : '已引用给当前会话'), 'ok')
+}
+
+async function adjustDigestWeight (msg, delta) {
+  if (!msg || !msg.code || !window.astral || !window.astral.messageWeight) return
+  try {
+    const list = await window.astral.messageDigests({ code: msg.code, limit: 1 })
+    const row = list && list.ok && list.data ? list.data[0] : null
+    if (!row) { toast('没有这个浓缩索引', 'err'); return }
+    const current = typeof row.dynamic_weight === 'number' ? row.dynamic_weight : (row.total_weight || 0.5)
+    const next = Math.max(0, Math.min(1, current + delta))
+    await window.astral.messageWeight({ code: msg.code, dynamicWeight: next, dimensions: { feedback: delta > 0 ? 1 : -1 }, scorer: 'user-feedback' })
+    toast(delta > 0 ? '已提高这条记忆的权重' : '已降低这条记忆的权重', 'ok')
+  } catch (err) { toast(err.message || '权重调整失败', 'err') }
+  closeContextMenu()
+}
+
+function openMessageContextMenu (event, msg) {
+  closeContextMenu()
+  const menu = h('div', {
+    class: 'msg-context-menu',
+    style: {
+      left: `${Math.min(event.clientX, window.innerWidth - 260)}px`,
+      top: `${Math.min(event.clientY, window.innerHeight - 360)}px`
+    },
+    onclick: (e) => e.stopPropagation()
+  })
+  const item = (label, hint, onClick, cls = '') => h('button', {
+    class: 'msg-context-item' + (cls ? ' ' + cls : ''),
+    type: 'button',
+    onclick: onClick
+  },
+  h('span', { class: 'msg-context-label', text: label }),
+  hint ? h('span', { class: 'msg-context-hint', text: hint }) : null
+  )
+  menu.append(
+    h('div', { class: 'msg-context-head' },
+      h('span', { class: 'msg-context-code', text: msg.code || '未编号' }),
+      h('span', { text: msg.kind === 'user' ? '用户消息' : 'AI 回复' })
+    ),
+    item('查看原文', '只读完整内容', () => { closeContextMenu(); openMessageViewer(msg.id) }),
+    item('复制原文', '复制未修改的完整文本', () => { closeContextMenu(); copyToClipboard(msg.text || '', '原文已复制') }),
+    h('div', { class: 'msg-context-sep' }),
+    item('引用给当前会话', '作为新消息发给当前对话', () => quoteToTarget(msg, { kind: 'current' })),
+    item('引用给超级智能体', '切到超级智能体并带入原文', () => quoteToTarget(msg, { kind: 'super' }))
+  )
+  const agents = ((state.roster && state.roster.agents) || [])
+    .filter((agent) => agent && agent.enabled !== false && agent.id !== state.activeAgentId)
+    .slice(0, 6)
+  if (agents.length) {
+    menu.append(h('div', { class: 'msg-context-sep' }))
+    menu.append(h('div', { class: 'msg-context-group', text: '引用给其他会话 / 成员' }))
+    for (const agent of agents) {
+      menu.append(item(agent.name, agent.title || '成员', () => quoteToTarget(msg, { kind: 'agent', agent })))
+    }
+  }
+  menu.append(
+    h('div', { class: 'msg-context-sep' }),
+    item(msg.ctxReleased ? '恢复上下文' : '释放上下文', '只影响下一轮模型上下文', async () => {
+      toggleContextRelease(msg)
+      bus.emit('message:update', { id: msg.id, patch: { ctxReleased: Boolean(msg.ctxReleased) } })
+      bus.emit('context:released')
+      closeContextMenu()
+      toast(msg.ctxReleased ? '已释放：下一轮起不再发给模型' : '已恢复：下一轮重新带上这条', 'ok')
+      try {
+        if (msg.thread === 'super' || superChatActive()) saveSuperHistoryNow()
+        else await saveProjectSessionNow()
+      } catch { /* 内存选择仍生效 */ }
+    })
+  )
+  if (msg.code) {
+    menu.append(
+      item('标记有用', '提高这条记忆的权重', () => adjustDigestWeight(msg, 0.08)),
+      item('标记无用', '降低这条记忆的权重', () => adjustDigestWeight(msg, -0.12))
+    )
+  }
+  document.body.append(menu)
+  contextMenu = menu
+  setTimeout(() => {
+    const close = (e) => {
+      if (!menu.contains(e.target)) { closeContextMenu(); document.removeEventListener('pointerdown', close) }
+    }
+    document.addEventListener('pointerdown', close)
+  }, 0)
 }
 
 export function attachMessageActions (node, msg) {
   if (!msg || msg.kind === 'system') return
+  if (node) {
+    node.addEventListener('contextmenu', (event) => {
+      if (event.target.closest('button, a, input, textarea, select, .msg-actions')) return
+      event.preventDefault()
+      openMessageContextMenu(event, msg)
+    })
+  }
   /* 直连会话不参与协作编排：撤回、改写、重新生成都只对项目会话有意义，
      在这里给按钮只会让人以为能改动作，所以只留查看、复制、引用与释放。 */
   const direct = msg.thread === 'super'

@@ -40,7 +40,7 @@ function ensureToken (kind, config, secrets) {
   return { config, secrets: { ...secrets, token: require('node:crypto').randomBytes(16).toString('hex') } }
 }
 
-function createIntake ({ store, configDir, secretBox, log } = {}) {
+function createIntake ({ store, configDir, secretBox, log, onIngest } = {}) {
   if (!store) throw new Error('createIntake 需要 store')
   const cfgFile = path.join(configDir || '.', 'intake.json')
   const config = Object.assign({ port: DEFAULT_PORT }, readJson(cfgFile, {}))
@@ -186,7 +186,13 @@ function createIntake ({ store, configDir, secretBox, log } = {}) {
 
   function ingest (channelId, raws) {
     const result = store.inbox({ action: 'ingest', id: channelId, messages: raws })
-    return result.ok ? result.data : { ok: false, error: result.error }
+    if (!result.ok) return { ok: false, error: result.error }
+    /* 有新消息就喊一声：渲染层要拿它去刷新常驻上下文，
+       否则「外面有人找你」要等切窗口才进提示词 —— 那已经不叫实时了。 */
+    if (typeof onIngest === 'function' && Number(result.data.inserted) > 0) {
+      try { onIngest({ channelId, ...result.data }) } catch { /* 通知失败不该丢消息 */ }
+    }
+    return result.data
   }
 
   /* ---------------------------------------------------------- HTTP 入口 */

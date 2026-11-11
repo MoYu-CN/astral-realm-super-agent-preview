@@ -198,6 +198,60 @@ function teamBlock (agent) {
   return lines.join('\n')
 }
 
+/* 团队工具箱：进入/切换项目时自动加载，团队主智能体不需要再让用户贴进度。 */
+function teamToolboxBlock () {
+  const box = state.teamToolbox
+  if (!box) return ''
+  const parse = (value) => {
+    if (Array.isArray(value)) return value
+    if (!value) return []
+    try { const data = JSON.parse(String(value)); return Array.isArray(data) ? data : [] } catch { return [] }
+  }
+  const team = parse(box.team_json)
+  const knowledge = parse(box.knowledge_json)
+  const decisions = parse(box.decisions_json)
+  let taskBrief = box.task_json || ''
+  try { const task = JSON.parse(taskBrief); taskBrief = typeof task === 'string' ? task : (task.text || task.brief || JSON.stringify(task)) } catch { /* 保留字符串 */ }
+  const lines = ['## 团队工具箱']
+  if (box.name) lines.push(`项目：${box.name}`)
+  if (box.progress) lines.push(`当前进度：${box.progress}`)
+  if (box.plan) lines.push(`## 团队计划书\n${box.plan}`)
+  if (taskBrief) lines.push(`## 任务详情 / 接管说明\n${taskBrief}`)
+  if (team.length) {
+    lines.push('团队成员：')
+    for (const member of team.slice(0, 16)) {
+      lines.push(`- ${member.name || member.id || '成员'}${member.role ? ` · ${member.role}` : ''}${member.duty ? `｜${member.duty}` : ''}`)
+    }
+  }
+  if (knowledge.length) {
+    lines.push('知识索引：')
+    for (const item of knowledge.slice(0, 12)) {
+      lines.push(`- ${typeof item === 'string' ? item : (item.title || item.id || JSON.stringify(item))}`)
+    }
+  }
+  if (decisions.length) {
+    lines.push('关键决策：')
+    for (const item of decisions.slice(0, 10)) {
+      lines.push(`- ${typeof item === 'string' ? item : (item.text || item.title || JSON.stringify(item))}`)
+    }
+  }
+  lines.push('这是接手团队的工作底稿；需要细节时按编号回查原文，不以记忆猜测。')
+  return lines.length > 2 ? lines.join('\n') : ''
+}
+
+/* 项目/团队消息的带编号浓缩索引；只给索引，不给全文。 */
+function projectDigestBlock () {
+  const rows = Array.isArray(state.projectDigests) ? state.projectDigests : []
+  if (!rows.length) return ''
+  const lines = ['## 项目浓缩索引', '需要原文时按编号回查；不要凭概括猜细节。']
+  for (const row of rows.slice(0, 16)) {
+    const at = String(row.time_text || row.created_at || '').replace('T', ' ').slice(0, 16)
+    const weight = typeof row.total_weight === 'number' ? ` w=${row.total_weight.toFixed(2)}` : ''
+    lines.push(`- ${row.code || '—'}${at ? ` [${at}]` : ''}${weight} ${String(row.one_line || row.digest || '').slice(0, 140)}`)
+  }
+  return lines.join('\n')
+}
+
 /* 内置默认规范：所有成员、两条通道都会带上。
    只写行为底线，不写身份与分工；身份提示词由成员自己的 prompt 叠加。
    保持简短，避免每次请求都浪费上下文。 */
@@ -497,6 +551,8 @@ export const CONTEXT_LAYERS = [
   { key: 'bio', label: '简介与说话风格', hint: '成员简介、性格与口吻' },
   { key: 'skills', label: '技能规范', hint: '通用技能与成员专属技能' },
   { key: 'notes', label: '项目 / 专属上下文', hint: '项目共享前提与该成员的专属笔记' },
+  { key: 'toolbox', label: '团队工具箱', hint: '项目进度、团队结构、知识与决策，进入项目时自动读取' },
+  { key: 'digests', label: '项目浓缩索引', hint: '带编号、时间与权重的项目/团队浓缩记录' },
   { key: 'protocol', label: '协作协议', hint: '汇报、交付与边界规则' },
   { key: 'data', label: '数据文件清单', hint: '本轮可用的数据文件与字段' },
   { key: 'thinking', label: '思考强度', hint: '本轮思考档位与展开程度' }
@@ -630,6 +686,12 @@ export function promptSections (agent, opts = {}) {
       : '',
     notes && notes.trim() ? `## 你的专属上下文\n${notes.trim()}` : ''
   ].filter(Boolean).join('\n\n'))
+
+  const toolbox = teamToolboxBlock()
+  if (toolbox) push('toolbox', '团队工具箱', toolbox)
+
+  const digests = projectDigestBlock()
+  if (digests) push('digests', '项目浓缩索引', digests)
 
   push('protocol', '协作协议', `## 协作协议\n${teamMode ? roleProtocol(agent) : SOLO_ROLE_PROTOCOL}`)
 

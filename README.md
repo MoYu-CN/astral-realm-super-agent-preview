@@ -8,7 +8,7 @@
 
 ![预览](docs/preview.png)
 
-![status](https://img.shields.io/badge/version-0.1.0-8b9cff) ![license](https://img.shields.io/badge/license-MIT-5eead4)
+![status](https://img.shields.io/badge/version-0.2.0-8b9cff) ![license](https://img.shields.io/badge/license-MIT-5eead4)
 
 [简体中文](#它是什么) · [English](#english)
 

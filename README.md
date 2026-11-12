@@ -1,4 +1,4 @@
-# 星界 · Astral Realm · 超级智能体试运行
+# 星界 · Astral Realm · 超级智能体试运行 / Super Agent Preview
 
 多 Agent、多模型的协作工作台。你划分编制，它们各司其职。
 
